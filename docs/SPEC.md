@@ -217,6 +217,9 @@ Rules:
 - Monitor rail: ceiling `UAD_MCP_MAX_MONITOR_DB` (default -6.0); max +6 dB increase per call;
   rolling max +10 dB per 30 s window; unmute and un-dim count as level events — if the stored
   level exceeds the ceiling, refuse with the exact remedy.
+- RULE FOR NEW TOOLS: any tool writing monitor `Mute` or `DimOn` MUST pass the current
+  monitor level in `WriteContext.monitor_level_db` — the gate cannot see topology and only
+  logs (does not refuse) when the context is missing.
 - Values clamped to the property's own min/max metadata; enums validated against `values`.
 - Global token-bucket rate limit: 10 writes/s, burst 20.
 - 48V writes require `confirm_condenser_mic=True` flowing in from the tool layer via `context`.

@@ -26,8 +26,12 @@ First public MCP server for UAD Console / the UA Mixer Engine.
   enforce its own read-only flags, so this gate is the only real write barrier.
 - **Hearing and speaker rails on monitor level**: a hard ceiling (`UAD_MCP_MAX_MONITOR_DB`,
   default -6 dB), a per-call step limit (+6 dB), and a rolling window budget (+10 dB per 30 s).
-  Unmuting and un-dimming are treated as level events and can be refused. Every refusal names the
-  environment variable or confirm flag that would unblock it.
+  Unmuting and un-dimming are treated as level events and can be refused. The rails fail closed:
+  if the monitor level cannot be read, the release is refused rather than allowed, on every path
+  including `uad_raw_set` and snapshot restore. Lowering `DimAttenuation` while dim is engaged is
+  railed as the level event it is. Snapshot restore never switches talkback ON (it restores OFF
+  only), so a restored session cannot silently open a mic without its auto-off timer. Every
+  refusal names the environment variable or confirm flag that would unblock it.
 - **Confirm gates**: 48V phantom power requires `confirm_condenser_mic=true` because phantom power
   destroys ribbon microphones; clock source and sample rate require `confirm=true` plus a
   meter check that no input is above -60 dB. `uad_set_clock` verifies `ClockLocked` and reverts
@@ -61,7 +65,7 @@ First public MCP server for UAD Console / the UA Mixer Engine.
 - **Documentation**: `README.md`, `AGENTS.md` (rules and canonical flows for LLM callers),
   `docs/PROTOCOL.md` (wire protocol cheatsheet), `docs/RECIPES.md`, and `docs/SPEC.md` (module
   contracts).
-- **405 tests** against `tests/mock_engine.py`, covering framing edge cases (split frames,
+- **500 tests** against `tests/mock_engine.py`, covering framing edge cases (split frames,
   batched frames, meter noise, abrupt disconnects, unanswered paths), reply interleaving,
   serialized writes under concurrency, reconnect and rediscovery, `readonly` mode reaching the
   wire zero times, the monitor rail as a property test, snapshot round-trips on a cascade fixture,

@@ -390,7 +390,7 @@ Bug reports are far more useful with the `--check` output plus the exact tool ca
 git clone https://github.com/fomoPhil/uad-console-mcp
 cd uad-console-mcp
 uv sync
-uv run pytest            # 405 tests, all against a mock engine, no hardware needed
+uv run pytest            # 500 tests, all against a mock engine, no hardware needed
 uv run ruff check .
 ```
 

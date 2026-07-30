@@ -20,7 +20,7 @@ First public MCP server for UAD Console / the UA Mixer Engine.
 - **Every write is verified by read-back**, reported per property as
   `{verified, before, after, warnings}` alongside the resolved `{device, index, name}`. Batch
   setters report per-item results and never abort the batch on one failure.
-- **Three-tier safety model** (`readonly` / `safe` / `full`), with a 34-property allowlist in
+- **Three-tier safety model** (`readonly` / `safe` / `full`), with a 35-property allowlist in
   `safe` mode and a permanent denylist (device identity, engine internals, `/pluginscenes`,
   firmware-like properties) that applies in every mode, including `full`. The engine does not
   enforce its own read-only flags, so this gate is the only real write barrier.

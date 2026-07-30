@@ -79,7 +79,11 @@ plus an `effects/0` child (the Unison slot: `EffectName`, `Preset`, `Power`, `pa
 `DimOn`, `MixToMono`, `AltMonEnabled`, `MixInSource`, `OutputDestination`.
 
 `/plugins/P`: catalog entry: `Name`, `Categories`, `Unison` (bool), `Authorized`, `Status`,
-`Preset` (with `values` = preset browser tree). 220 plugins on the fixture.
+`Preset` (with `values` = preset browser tree). 215 plugins on the fixture.
+
+NOTE: 13 properties in the captured fixture have NO `value` key at all (e.g.
+`/devices/0/auxs/0/Gain`, `/devices/0/inputs/27/IOType`). All metadata parsing must tolerate
+a missing value (UAProperty.value becomes None).
 
 ## 3. Fixture format
 
@@ -239,7 +243,33 @@ Rules:
 
 ### 4.5 `server.py` + `__main__.py`
 
-- `FastMCP("uad-console")`, stdio transport. Tools per the table in the plan (§Tool surface):
+Tool surface (~19 tools):
+
+| Tool | Purpose |
+|---|---|
+| uad_get_status | ALL devices in the cascade: clock, sample rate, DSP load if available, engine vs device online, safety mode + effective limits |
+| uad_list_channels | across every unit, grouped by device: names, types, fader, mute/solo, pan, hidden, stereo links |
+| uad_set_channels | BATCH: fader_db/pan/mute/solo/rename/hide per item, per-item results; name-or-index targeting with optional `device` |
+| uad_set_preamp | gain_db, pad, low_cut, phase, hi_z, source (Mic/Line); 48V requires confirm_condenser_mic=true |
+| uad_set_sends | BATCH: channel → aux/cue level_db/pan/bypass |
+| uad_set_monitor | level_db (railed), dim, mute, mono, alt speaker; unmute/un-dim go through the rail |
+| uad_talkback | on/off + level; auto-off timeout (default 30 s, asyncio task) |
+| uad_safe_state | no params: mute monitor outputs + talkback off; the panic button |
+| uad_set_clock | clock source; verify ClockLocked after 2.5 s, auto-revert on failure; refuses if audio flowing |
+| uad_set_sample_rate | separate, confirm=true required, same audio-flowing refusal |
+| uad_list_plugins | UAD catalog: name, categories, unison-capable, authorized |
+| uad_get_inserts | what is loaded where (inserts + Unison) across channels |
+| uad_load_plugin | insert slot 0-3 or slot="unison"; polls for parameters to materialize (5 s timeout) |
+| uad_remove_plugin | clears a slot (EffectName "") |
+| uad_get_plugin_params | list a loaded plugin's parameters with values |
+| uad_set_plugin_params | BATCH by param name; `normalized` (0-1) values |
+| uad_plugin_preset | recall preset by name from the engine's catalog |
+| uad_peek_meters | one-shot, all (or filtered) channels |
+| uad_watch_meters | poll up to `duration_s` (cap 30), early-exit when any watched channel exceeds `threshold_db`; returns per-channel peaks |
+| uad_snapshot | action=save/list/diff/restore; restore defaults dry_run=true; ignore globs for diff |
+| uad_raw_get | raw read of any path; raw set ONLY in `full` mode (separate uad_raw_set registered only when mode=full) |
+
+- `FastMCP("uad-console")`, stdio transport:
   all `uad_`-prefixed, batch setters accept lists, every write result is
   `{verified: bool, before, after, warnings: [str]}` per item plus resolved
   `{device, index, name}` identity. Descriptions: first line = what it does; include one

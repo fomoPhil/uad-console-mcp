@@ -204,21 +204,20 @@ and compares.
 
 ```
 uad_set_sends(items=[
-  {target: 8,  send: "cue1", level_db: -6},
-  {target: 9,  send: "cue1", level_db: -8},
-  {target: 10, send: "cue1", level_db: -12},
-  {target: 11, send: "cue1", level_db: -10, pan: -1.0},
-  {target: 12, send: "cue1", level_db: -10, pan:  1.0},
+  {target: "KICK IN",   send: "cue1", level_db: -6},
+  {target: "SNARE TOP", send: "cue1", level_db: -8},
+  {target: "SNARE BTM", send: "cue1", level_db: -12},
+  {target: "OH L",      send: "cue1", level_db: -10, pan: -1.0},
+  {target: "OH R",      send: "cue1", level_db: -10, pan:  1.0},
 ])
 -> results[0]: {send: "cue1", resolved: {index: 8, name: "KICK IN"}, ok: true,
                 writes: [{path: "/devices/0/inputs/8/sends/2/Gain",
                           verified: true, before: -144.0, after: -6.0}]}
 ```
 
-Those targets are **indices**, not the new names. The topology cache holds channel names for 30
-seconds, so immediately after a rename the resolver still knows the old name while
-`uad_list_channels` already reports the new one. Target by index (or by the old name) inside the
-same flow, or do the renames last.
+The new names work immediately: a verified rename updates the cached topology in place, so the
+resolver does not have to wait out its 30 second TTL. Send IDs are resolved from the engine too,
+which is why `cue1` landed on `sends/2` here rather than on a guessed index.
 
 ```
 uad_watch_meters(targets=["KICK IN","SNARE TOP","OH L","OH R"], duration_s=10, threshold_db=-40)
@@ -299,16 +298,18 @@ but they carry the studio judgement that does not belong in a tool description.
 
 | Skill | What it is for |
 |---|---|
-| `apollo-onboarding` | First contact with an unknown rig: run `--check`, walk the topology, work out what is physically connected and which strips matter, name things sensibly, and save a baseline snapshot before changing anything |
-| `apollo-studio-tasks` | The recurring studio jobs: set up a tracking input end to end, build a cue mix, gain-stage against real meters, onboard an ADAT expander, chase a clock fault, recover from a panic |
+| `apollo-onboarding` | Planning and configuring a rig from scratch: the interview questions to ask, which physical input suits which source, the clock master decision for ADAT expanders and other digital gear, ADAT sample-rate and S/MUX channel limits, multi-Apollo cascades, then channel naming, hiding and a baseline snapshot |
+| `apollo-studio-tasks` | Day-to-day operation: tracking setup with a Unison preamp and honest gain staging, insert chains, cue and headphone mixes for one or several performers, podcast and streaming layouts, troubleshooting decision trees ("no sound from channel 3", clicks and pops, a strip that vanished), and snapshot-before-you-experiment habits |
 
-Install by copying either directory into your personal skills folder:
+Each skill is a self-contained directory: a `SKILL.md` plus a `references/` folder it points at
+when a step needs the detail. Install by copying both into your personal skills folder:
 
 ```bash
 mkdir -p ~/.claude/skills
-cp -R skills/apollo-onboarding ~/.claude/skills/
-cp -R skills/apollo-studio-tasks ~/.claude/skills/
+cp -R skills/apollo-onboarding skills/apollo-studio-tasks ~/.claude/skills/
 ```
+
+See [`skills/README.md`](skills/README.md) for details.
 
 For agent-facing rules (hard prohibitions, canonical tool sequences, an error table and a studio
 glossary), see [AGENTS.md](AGENTS.md).
@@ -336,12 +337,12 @@ Bug reports are far more useful with the `--check` output plus the exact tool ca
 git clone https://github.com/fomoPhil/uad-console-mcp
 cd uad-console-mcp
 uv sync
-uv run pytest            # 404 tests, all against a mock engine, no hardware needed
+uv run pytest            # 405 tests, all against a mock engine, no hardware needed
 uv run ruff check .
 ```
 
-Tests marked `live` need a real engine and a real Apollo and are excluded by default
-(`addopts = -m 'not live'`). Run them deliberately, never in CI:
+A further 7 tests in `tests/live/` are marked `live`: they need a real engine and a real Apollo,
+and are excluded by default (`addopts = -m 'not live'`). Run them deliberately, never in CI:
 
 ```bash
 UAD_MCP_LIVE=1 uv run pytest -m live

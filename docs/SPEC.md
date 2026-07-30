@@ -10,7 +10,7 @@ updating this file.
   is closed). Multiple concurrent clients are fine (Console itself is just another client).
 - Every message in BOTH directions is UTF-8 JSON text terminated by a single `\0` byte.
 - Requests: `<verb> <path>[ <json-value>]` where verb is `get`, `set`, `subscribe`,
-  `unsubscribe`, or `post`. Unknown verbs are **silently dropped** (no reply — never wait on one).
+  `unsubscribe`, or `post`. Unknown verbs are **silently dropped** (no reply, so never wait on one).
 - Replies and broadcasts are JSON objects with a `path` key. There is NO request/response
   correlation ID. Broadcasts (subscription pushes, other clients' changes) interleave freely
   with replies. Dispatch strictly by matching `path`.
@@ -30,7 +30,7 @@ updating this file.
   `{value, string, enabled}` objects).
 - Getting a **node** returns ALL its scalar properties inline; children returned as name → `{}`.
 - Numeric values: faders/gains in dB (`FaderLevel` -144..12); `*Tapered` twins are 0..1.
-  The engine quantizes tapered values to a coarse grid — prefer the dB properties for writes.
+  The engine quantizes tapered values to a coarse grid, so prefer the dB properties for writes.
 
 ### CRITICAL SAFETY FACT (VERIFIED)
 
@@ -38,7 +38,7 @@ The engine does NOT enforce its own `readonly` flags: a `set` on `DeviceHwID`
 (`readonly: true`) was **accepted and applied**. Consequences:
 1. `safety.py` is the only real write barrier. It maintains an allowlist of writable property
    names (see §5); everything else is refused in `safe` mode.
-2. NEVER "probe by writing" against real hardware — not in code, not in tests, not manually.
+2. NEVER "probe by writing" against real hardware: not in code, not in tests, not manually.
    All write-behavior tests run against the mock engine.
 
 ### Known quirks
@@ -56,7 +56,7 @@ The engine does NOT enforce its own `readonly` flags: a `set` on `DeviceHwID`
 
 Root children: `devices`, `inputroutes`, `outputroutes`, `plugins`, `pluginscenes`.
 Root properties include `SampleRate` (enum), `ClockSource` (enum: Internal/Word Clock/ADAT/
-S-PDIF), `ClockLocked` (bool), `Dirty`, `Tempo`, `MixerState`, `AppCommand` (opaque — never write).
+S-PDIF), `ClockLocked` (bool), `Dirty`, `Tempo`, `MixerState`, `AppCommand` (opaque, never write).
 
 `/devices/N` (one per cascaded Apollo; `MultiUnitOrder` gives chain position):
 properties `DeviceName`, `DeviceTypeID`, `DeviceOnline`, `CueBusCount`, `TalkbackMaster`,
@@ -75,7 +75,7 @@ plus an `effects/0` child (the Unison slot: `EffectName`, `Preset`, `Power`, `pa
 `PostFaderOverride`. `.../meters/0`: `MeterLevel`, `MeterPeakLevel`, `MeterClip`.
 
 `/devices/N/outputs/O`: monitor output identified by the PRESENCE of `CRMonitorLevel` /
-`CRMonitorLevelTapered` properties (index differs per model — NEVER hardcode). Others: `Mute`,
+`CRMonitorLevelTapered` properties (index differs per model, NEVER hardcode). Others: `Mute`,
 `DimOn`, `MixToMono`, `AltMonEnabled`, `MixInSource`, `OutputDestination`.
 
 `/plugins/P`: catalog entry: `Name`, `Categories`, `Unison` (bool), `Authorized`, `Status`,
@@ -94,12 +94,12 @@ Derived fixtures are GENERATED at test time by `tests/fixtures/derive.py` (do no
 - `cascade`: duplicates `/devices/0` as `/devices/1` (DeviceName "Apollo x8 Gen 2 #2",
   MultiUnitOrder 1, input names prefixed "B ").
 - `twin`: strips to 2 preamp inputs + 2 line + 2 virtual + 1 monitor out, renames DeviceTypeID
-  "Apollo Twin X" — catches hardcoded-index assumptions.
+  "Apollo Twin X". Catches hardcoded-index assumptions.
 
 ## 4. Module contracts
 
 All code: Python 3.11+, full type hints, `ruff` clean (config in pyproject), stdlib + `mcp` only.
-Never call `time.sleep` in async code. No prints — `logging` with logger `uad_console_mcp.*`
+Never call `time.sleep` in async code. No prints: use `logging` with logger `uad_console_mcp.*`
 (MCP stdio servers MUST NOT write to stdout; log to stderr).
 
 ### 4.1 `client.py`
@@ -120,7 +120,7 @@ class UAClient:
     def __init__(self, host: str = "127.0.0.1", port: int = 4710, *,
                  connect_timeout: float = 2.0, scalar_timeout: float = 2.0,
                  tree_timeout: float = 15.0) -> None: ...
-    async def connect(self) -> None            # idempotent; lazy — every public op calls it
+    async def connect(self) -> None            # idempotent; lazy: every public op calls it
     async def aclose(self) -> None
     @property
     def connected(self) -> bool: ...
@@ -210,15 +210,15 @@ Rules:
   LowCut, HiZ, IOType, Bypass, PostFaderOverride, EffectName, Preset, Power, NormalizedValue,
   CRMonitorLevel, DimOn, MixToMono, DimAttenuation, TalkbackOn, TalkbackMaster,
   TalkbackEnabled, AltMonSelection, ClockSource, SampleRate, StereoName, Stereo, EnabledByUser`
-  — and clock/sample-rate additionally require the tool-level confirm gates.
+  Clock and sample-rate additionally require the tool-level confirm gates.
 - `full`: allowlist bypassed (raw set enabled) but monitor rail and rate limit still apply.
 - Denylist in ALL modes: `DeviceHwID`, `MultiUnitOrder`, `AppCommand`, `MixerState`,
   anything under `/pluginscenes` writes, firmware/system props.
 - Monitor rail: ceiling `UAD_MCP_MAX_MONITOR_DB` (default -6.0); max +6 dB increase per call;
-  rolling max +10 dB per 30 s window; unmute and un-dim count as level events — if the stored
+  rolling max +10 dB per 30 s window; unmute and un-dim count as level events: if the stored
   level exceeds the ceiling, refuse with the exact remedy.
 - RULE FOR NEW TOOLS: any tool writing monitor `Mute` or `DimOn` MUST pass the current
-  monitor level in `WriteContext.monitor_level_db` — the gate cannot see topology and only
+  monitor level in `WriteContext.monitor_level_db`, because the gate cannot see topology and only
   logs (does not refuse) when the context is missing.
 - Values clamped to the property's own min/max metadata; enums validated against `values`.
 - Global token-bucket rate limit: 10 writes/s, burst 20.
@@ -228,12 +228,12 @@ Rules:
 
 ### 4.4 `snapshot.py`
 
-- `capture(client, rig) -> dict` — walks devices, keeps ONLY allowlisted-writable properties
+- `capture(client, rig) -> dict`: walks devices, keeps ONLY allowlisted-writable properties
   (same list as safety `safe` mode, minus ClockSource/SampleRate which are captured into
   `_meta` but not restored by default). Each entry: `{path, value, meta: {type,min,max,values}}`.
   Doc: `{schema_version: 1, created: iso8601, devices: [...], sample_rate, entries: [...]}`.
 - Files: `~/.uad-console-mcp/snapshots/<name>.json`. `list_snapshots()`, `load(name)`.
-- `diff(client, rig, doc, ignore: list[str]) -> list[Change]` — glob patterns against paths.
+- `diff(client, rig, doc, ignore: list[str]) -> list[Change]`: glob patterns against paths.
 - `restore(client, rig, doc, *, dry_run=True, include_clock=False, include_monitor=False)`:
   1. auto-capture a `pre-restore-<ts>` snapshot first (not in dry-run);
   2. refuse cross-model restore (DeviceTypeID mismatch) unless `allow_cross_model=True`
@@ -276,16 +276,16 @@ Tool surface (~19 tools):
   all `uad_`-prefixed, batch setters accept lists, every write result is
   `{verified: bool, before, after, warnings: [str]}` per item plus resolved
   `{device, index, name}` identity. Descriptions: first line = what it does; include one
-  "Use when:" and one "Not for:" line (e.g. set_monitor: "Not for headphone level — the
+  "Use when:" and one "Not for:" line (e.g. set_monitor: "Not for headphone level: the
   protocol cannot set it; see uad://limitations").
 - Resources: `uad://state` (get_status payload), `uad://channels`, `uad://limitations`
   (the cannot-do list + workarounds).
 - Prompts: `setup_vocal_tracking`, `onboard_adat_expander`, `troubleshoot_clock`,
-  `panic_reset` — mirrored prose lives in docs/RECIPES.md.
+  `panic_reset`. Mirrored prose lives in docs/RECIPES.md.
 - Errors surfaced to the LLM must be actionable sentences, never tracebacks. Connection
-  failure text: "UA Mixer Engine not reachable on 127.0.0.1:4710 — is the UAD software
+  failure text: "UA Mixer Engine not reachable on 127.0.0.1:4710 - is the UAD software
   installed and running? (It starts with UAD Console and keeps running afterwards.)"
-- `__main__.py`: `main()` with argparse — default: serve; `--check`: doctor (engine reachable,
+- `__main__.py`: `main()` with argparse. Default: serve; `--check`: doctor (engine reachable,
   devices + online states, safety mode + effective limits, sample rate/clock, plugin count);
   `--dump-tree [FILE]`: fixture-format walk (sanitizes the home directory out of string
   values); `--version`.
@@ -316,7 +316,7 @@ for given paths).
 
 Required coverage: framing edges (all adversarial modes); interleaving correctness; N
 concurrent tool calls → mock observes strictly serialized sets; reconnect (drop_after) →
-pending ops fail with UAConnectError, next op reconnects, discovery re-runs — including a
+pending ops fail with UAConnectError, next op reconnects, discovery re-runs, including a
 reconnect where the fixture swapped to the twin (channel count changed); readonly mode →
 `mock.set_count() == 0` after exercising every write tool; monitor rail property test: no
 sequence of uad_set_monitor calls can exceed the ceiling; snapshot round-trip on cascade
@@ -330,7 +330,7 @@ under `tests/live/` marked `live`, skipped unless `UAD_MCP_LIVE=1`.
 - Line 1 of README: unofficial, not affiliated with/endorsed by Universal Audio; UAD, Apollo,
   Unison, Console are trademarks of Universal Audio, Inc.
 - Protocol knowledge: independent implementation informed by published community
-  descriptions — credit `raduvarga/UA-Midi-Control` (origin write-up), `Kalskiid/ua-commander`
+  descriptions. Credit `raduvarga/UA-Midi-Control` (origin write-up), `Kalskiid/ua-commander`
   (MIT; heartbeat + monitor-discovery patterns), `uaaccess` and `open-apollo` (referenced,
-  GPL — no code or data copied). Fixture is our own capture from our own device.
+  GPL, no code or data copied). Fixture is our own capture from our own device.
 - Hearing/equipment damage disclaimer near the top of README (monitor levels, 48V + ribbon mics).

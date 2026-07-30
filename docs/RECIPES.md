@@ -1,0 +1,263 @@
+# Recipes
+
+The server ships four prompts. If your MCP client exposes prompts (Claude Desktop and Claude Code
+both do), you can invoke them by name and the model gets the full instruction text. This file is
+the human-readable version of the same four, plus a gain-staging guide and a worked ADAT expander
+walkthrough.
+
+| Prompt | Use it when |
+|---|---|
+| `setup_vocal_tracking` | Getting a microphone recording-ready, end to end |
+| `onboard_adat_expander` | Adding an 8-channel ADAT expander or a second interface in ADAT mode |
+| `troubleshoot_clock` | A digital input reads nothing, or the clock will not lock |
+| `panic_reset` | Feedback, a runaway level, anything unexpectedly loud |
+
+A note that applies to all of them: every write this server makes is read back and reported as
+`verified`. If a model tells you it changed something, ask it what the read-back said.
+
+---
+
+## 1. Set up an input for vocal tracking
+
+The order matters. Gain is set against a real performance, not guessed, and phantom power is the
+one step that waits for you.
+
+1. **Check the rig.** `uad_get_status`: is the interface online, what is the sample rate and clock
+   source, and which safety mode is active? In `readonly` mode nothing below will work, and the
+   model should say so rather than trying.
+2. **Find the strip.** `uad_list_channels(kind="input")` and pick the one with
+   `has_preamp: true` that the microphone is actually plugged into. If it is not obvious, the model
+   should ask instead of guessing.
+3. **Label and clear it.** `uad_set_channels` with a meaningful `name` (for example `LEAD VOX`),
+   `mute: false`, `fader_db: 0`, `hidden: false`, `solo: false`. A named strip is worth the ten
+   seconds later.
+4. **Preamp basics.** `uad_set_preamp` with `low_cut: true` for a close vocal, `pad: false`,
+   `phase: false`, and `gain_db: 20` as a starting point only.
+5. **Phantom power, deliberately.** 48V goes on only after you have said the microphone is a
+   condenser: `uad_set_preamp(phantom_48v=true, confirm_condenser_mic=true)`. **48V can permanently
+   destroy a ribbon microphone.** Without your confirmation the write is refused, which is correct
+   behaviour, not a bug.
+6. **Set the gain against the loudest thing they will actually do.**
+   `uad_watch_meters(targets=["LEAD VOX"], duration_s=10, threshold_db=-6)`, aiming for peaks
+   between -12 and -6 dBFS. Adjust `gain_db` in about 3 dB steps and re-measure. Never chase a
+   target by more than 6 dB in one move.
+7. **Character, if you want it.** `uad_list_plugins(unison_only=true, authorized_only=true)`, then
+   `uad_load_plugin(target="LEAD VOX", plugin=..., slot="unison")` for the preamp emulation, and
+   inserts for a compressor and an EQ. Each load reports `materialized`: if it is false the
+   parameter nodes have not appeared yet and parameter writes will be skipped rather than lost.
+8. **The singer's headphones.** `uad_set_sends` with `send: "cue1"` and `level_db` around -6, plus
+   some of the backing track. The headphone output *level* cannot be set from here at all, so the
+   cue balance is made entirely with send levels and the final trim is the physical knob.
+9. **Control room.** `uad_set_monitor(level_db=...)`. The ceiling is enforced. If a request is
+   refused, the right response is to tell you the stored level and the ceiling, not to retry.
+10. **Save it.** `uad_snapshot(action="save", name="vocal-tracking")`, so tomorrow's session starts
+    from today's setup.
+
+Session rules worth stating out loud to the model: never engage 48V without explicit confirmation,
+never raise the monitor level to "check" something, and if anything squeals call `uad_safe_state`
+first and ask questions afterwards.
+
+---
+
+## 2. Onboard an ADAT expander
+
+Adding an ADA8200, a second interface in ADAT mode, or any 8-channel optical expander.
+
+1. **Write down the clock facts first.** `uad_get_status` gives `clock.source`, `clock.locked` and
+   `clock.sample_rate`. Those three decide everything else.
+2. **Cabling, stated in ports you can look at.** The expander's ADAT OUT goes to the Apollo's ADAT
+   IN. If the expander is going to be slaved to the Apollo, the Apollo's ADAT OUT must **also** go
+   back to the expander's ADAT IN (or use word clock). Optical cables fail silently, so check both
+   ends physically.
+3. **Decide who is master. Exactly one device may be.**
+   - *Apollo master* (`ClockSource: Internal`): the expander must be set to slave from ADAT (or word
+     clock) on the return cable, at the same sample rate.
+   - *Expander master*: `uad_set_clock(source="ADAT", confirm=true)`. It refuses while audio is
+     flowing, so stop playback and recording first.
+   - Never both internal, never both slaved. Both internal means nothing locks and audio drifts or
+     clicks. Both slaved means nothing locks at all.
+4. **Sample rates must match exactly.** At 88.2 or 96 kHz ADAT runs S/MUX, so the 8 channels become
+   4. Channels 5 to 8 going dead at high rates is expected behaviour, not a fault.
+5. **Name the strips.** `uad_list_channels(kind="input")` and find the ones with `io_type: "ADAT"`.
+   With `uad_set_channels`, rename each to what is physically patched into the expander, set
+   `hidden: false`, `enabled: true`, `fader_db: 0`, `mute: false`.
+6. **Verify with signal, not with hope.** Send something through the expander, then
+   `uad_peek_meters(targets=[...the ADAT channels...])`. If every ADAT meter sits at exactly the
+   floor (-77 dB), that is the signature of no clock lock or a dead optical cable, **not** silence.
+   Go to recipe 3.
+7. **Snapshot it** once all 8 channels meter correctly: `uad_snapshot(action="save",
+   name="adat-expander")`.
+
+---
+
+## 3. Troubleshoot clock and missing digital audio
+
+For no signal on ADAT or S/PDIF inputs, a clock that will not lock, or garbled digital audio. Read
+each step's numbers before acting on them.
+
+1. `uad_get_status`. Note `clock.source`, `clock.locked`, `clock.sample_rate`.
+2. **If `clock.locked` is false**, the Apollo is chasing a clock it cannot see: the external device
+   is off, unplugged, or at a different rate, or `ClockSource` points at an input with no clock on
+   it. To get back to known-good, stop all audio and call
+   `uad_set_clock(source="Internal", confirm=true)`. That tool verifies lock and reverts itself if
+   the new source does not lock.
+3. **If `clock.locked` is true but a digital input reads nothing**, run `uad_peek_meters` on the
+   ADAT and S/PDIF strips. Every digital meter pinned at exactly the floor is the classic signature
+   of a dead digital link. A floor reading **cannot** tell silence from a dead link, so "the source
+   is just quiet" is not a conclusion you are allowed to draw.
+4. **Then check who is master.** Apollo master (`Internal`) means every outboard converter must be
+   slaved to it, from the ADAT return cable or from word clock out. A device left on its own
+   internal clock will never lock here. External master means the Apollo's `ClockSource` must be
+   `ADAT`, `Word Clock` or `S/PDIF` to match, and the external rate must equal the Apollo's.
+5. **Sample rate mismatch is the single most common cause.** 44.1 against 48 kHz shows up as no lock
+   or as garbled, wrong-pitch audio. Compare the device's front panel to `clock.sample_rate`.
+6. **Cabling.** Swap the optical cable. Confirm OUT goes to IN in both directions, and that you are
+   not looking at an S/PDIF optical port. TOSLINK failures are silent.
+7. **After every change**, `uad_get_status` again for `clock.locked`, then `uad_peek_meters` to
+   confirm signal is actually arriving.
+
+Why the confirmations exist: `uad_set_clock` and `uad_set_sample_rate` both refuse while audio is
+flowing (any input above -60 dB) and both require `confirm=true`, because re-locking the clock
+glitches or drops every running stream. Stop playback and recording first.
+
+---
+
+## 4. Panic reset
+
+Something is wrong right now. Get safe first, diagnose second.
+
+1. **Immediately** `uad_safe_state`. No parameters, no confirmation, no questions: it mutes every
+   monitor output and turns talkback off.
+2. `uad_get_status` to see where things stand.
+3. **With the monitors still muted**, find the cause. `uad_list_channels` for channels that are
+   unexpectedly unmuted, soloed, or sitting at a high `fader_db`; `uad_peek_meters` for what is
+   actually hot. An open microphone next to its own monitor is the usual feedback path.
+4. Fix the cause with `uad_set_channels`: mute the offender, `solo: false`, sensible `fader_db`.
+5. **Only then** bring the monitors back: `uad_set_monitor(mute=false)`. If that is refused, the
+   stored monitor level is above the safety ceiling: lower it first with
+   `uad_set_monitor(level_db=...)`, then release the mute. Come up in steps. The rail allows at most
+   +6 dB per call and +10 dB per 30 seconds.
+6. If the state is scrambled beyond quick repair, `uad_snapshot(action="list")`, then
+   `uad_snapshot(action="restore", name=..., dry_run=true)` to see the exact ordered write list
+   before running it with `dry_run=false`. A real restore captures a `pre-restore-*` snapshot first,
+   so it is recoverable.
+
+Do not, while sorting this out: raise the monitor level to hear whether it is fixed, unsolo or
+unmute everything at once, change the clock source or sample rate, or engage 48V.
+
+---
+
+## Gain staging with the meters this server can read
+
+### Targets
+
+| Measure | Target | Why |
+|---|---|---|
+| Average level while performing | about **-18 dBFS** | Leaves headroom and sits where analog-modelled plugins expect signal |
+| Peaks on the loudest passage | **under -6 dBFS**, aim -12 to -6 | Keeps margin for a louder take without clipping the converter |
+| `MeterClip` | never true | The converter clipped, and that cannot be undone after the fact |
+
+Anything averaging near 0 dBFS is too hot no matter how it sounds. Anything averaging near
+-50 dBFS needs so much makeup gain later that the noise floor comes with it.
+
+### Method
+
+1. **Set a starting gain, then measure.** Do not compute the "right" gain in advance:
+   `uad_set_preamp(target="LEAD VOX", source="Mic", gain_db=20, low_cut=true)`.
+2. **Measure against the loudest thing the performer will actually do**, not a spoken test:
+   `uad_watch_meters(targets=["LEAD VOX"], duration_s=10, threshold_db=-6)`. An early exit means it
+   is already too hot.
+3. **Adjust in about 3 dB steps and re-measure.** Never more than 6 dB in one move: a single big
+   jump either clips the next take or buries it.
+4. **Quote the number, not a judgement.** "Peaked at -4.2 dB, dropping the preamp 6 dB and
+   re-checking" is useful. "Sounds about right" is not.
+5. **Too hot at minimum gain?** `uad_set_preamp(pad=true)`, then re-measure, because the pad's
+   attenuation differs per model.
+
+### Reading the numbers
+
+| Reading | Meaning |
+|---|---|
+| `-77.0` (or -76.99999) | Device-silence floor. Silence **or** a dead digital link, indistinguishable |
+| `-144.0` | Absolute floor |
+| around -18 | Healthy average for a performance |
+| above -6 | Too hot, back the gain off |
+| `clip: true` | The converter clipped. Fix the gain and redo the take |
+
+Two things the meters cannot do: they are polled at about 3 Hz (not sample-accurate, so a single
+short transient can be missed), and `uad_watch_meters` is capped at 30 seconds per call by design.
+
+On a **digital** input, a floor reading is a clock suspicion, not a silence conclusion.
+
+---
+
+## Worked example: eight ADAT channels that were not there
+
+This is the real debugging session that shaped the tools, condensed. It is the single most common
+ADAT failure, and it looks exactly like broken hardware.
+
+**The symptom.** An 8-channel expander is connected to the Apollo's optical input. Console shows the
+strips. Nothing meters, on any of them, ever.
+
+**What the tools said.**
+
+```
+uad_peek_meters(kind="input")
+-> "UG 1".."UG 8" all at level_db: -76.99999237060547, at_floor: true
+   note: "A meter at the floor cannot distinguish a silent source from a dead digital link..."
+
+uad_get_status()
+-> clock: {source: "Internal", locked: true, sample_rate: 48000}
+```
+
+That combination is the whole diagnosis:
+
+- All eight ADAT strips at exactly the floor. Eight independent sources do not all go silent at
+  once, so this is one shared cause: the link, not the sources.
+- `ClockSource: Internal` means **the Apollo is the clock master**.
+- `ClockLocked: true` is a red herring here. The Apollo is locked to its own internal clock and
+  reports so happily. It says nothing about whether the expander is locked to anything.
+- And there was **one optical cable in the rig**: expander OUT into Apollo IN.
+
+**The trap.** With the Apollo as master, the expander has to receive its clock from somewhere. The
+only path for that is the return cable, Apollo ADAT OUT into expander ADAT IN, and there was no
+return cable. So the expander ran on its own internal clock, the two boxes drifted, and the Apollo
+never resolved a valid ADAT stream. From the mixer's point of view the input is digitally silent,
+which is exactly the floor reading.
+
+**The fix, either way round.**
+
+*Option A, Apollo stays master (usually what you want):*
+
+1. Add the second optical cable: Apollo ADAT OUT into expander ADAT IN.
+2. Set the expander's clock switch to slave from ADAT (some units label it SYNC, EXT, or ADAT IN).
+3. Match the sample rate on the expander to the Apollo's `clock.sample_rate`.
+4. Leave the Apollo on `ClockSource: Internal`.
+
+*Option B, expander is master:*
+
+1. Set the expander to internal clock at the rate you want.
+2. Stop all playback and recording, then `uad_set_clock(source="ADAT", confirm=true)`. It refuses
+   while audio is flowing, verifies `ClockLocked` after 2.5 seconds, and reverts itself if the new
+   source never locks.
+
+**Verify with signal, not with a status flag.**
+
+```
+uad_watch_meters(targets=["UG 1","UG 2","UG 3","UG 4"], duration_s=10, threshold_db=-40)
+-> {"triggered": true, "triggered_channels": ["UG 1"],
+    "peaks_db": {"UG 1": -12.4, "UG 2": -18.9, "UG 3": -22.1, "UG 4": -21.7}}
+```
+
+`triggered: true` with real peaks is proof. `ClockLocked: true` on its own is not.
+
+**Then name them**, because `UG 1` through `UG 8` tells you nothing at 2am, and snapshot the
+result: `uad_snapshot(action="save", name="adat-expander")`.
+
+**Two more expander gotchas from the same session.**
+
+- **High rates halve the channel count.** At 88.2 or 96 kHz, ADAT uses S/MUX and carries 4 channels
+  instead of 8. Channels 5 to 8 sitting at the floor at 96 kHz is the protocol working as designed.
+- **Optical failures are silent.** A cracked TOSLINK cable, a cable in the S/PDIF optical port
+  instead of the ADAT one, or a cable in the wrong direction all present identically: floor
+  readings on every channel. Swap the cable before you suspect the converter.

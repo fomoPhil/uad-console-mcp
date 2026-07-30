@@ -39,9 +39,9 @@ Instructions for an LLM driving `uad-console-mcp`. Human-facing docs: [README.md
 9. **Meter targets are names.** `uad_peek_meters` / `uad_watch_meters` take `targets: list[str]`
    resolved by name. A numeric string is matched as a name first: `"8"` matches `ANALOG 8`,
    `UG 8` and `VIRTUAL 8` and errors as ambiguous. Pass exact names.
-10. **After a rename, target by index for the rest of the flow.** The topology cache holds names
-    for 30 s, so the resolver still knows the old name while `uad_list_channels` reports the new
-    one. Or do renames last.
+10. **A verified rename is usable immediately** (the cached topology is updated in place), but if a
+    rename comes back `verified: false` the old name is still the truth. Use the index until a
+    fresh `uad_list_channels` proves otherwise.
 11. **With more than one device, always pass `device`.** An index that exists on several Apollos is
     ambiguous, by design.
 12. **Snapshot before experimenting**, and show a `dry_run=true` restore before running it for real.
@@ -79,8 +79,8 @@ uad_watch_meters(targets=["LEAD VOX"], duration_s=10, threshold_db=-6)
   -> {"triggered": false, "peaks_db": {"LEAD VOX": -18.2}}   aim for peaks -12 to -6 dBFS
 uad_set_preamp(target=0, gain_db=26)   # move in <= 6 dB steps, re-measure after each
 uad_list_plugins(unison_only=true, authorized_only=true)
-uad_load_plugin(target=0, plugin="UA 610-B Tube Preamp", slot="unison")
-  -> {"materialized": true, "parameter_count": 9}   materialized false = params not addressable yet
+uad_load_plugin(target=0, plugin="UAD UA 610-B", slot="unison")   # exact name from the catalog
+  -> {"materialized": true, "parameter_count": N}   materialized false = params not addressable yet
 uad_set_sends(items=[{"target": 0, "send": "cue1", "level_db": -6}])
 uad_snapshot(action="save", name="vocal-tracking")
 ```

@@ -41,6 +41,7 @@ from uad_console_mcp.safety import (  # noqa: E402
     SafetyGate,
     SafetyRefusal,
     WriteContext,
+    coerces_to_false,
     gate_from_env,
     mode_from_env,
     property_name,
@@ -49,6 +50,7 @@ from uad_console_mcp.safety import (  # noqa: E402
 # The exact SPEC §4.3 safe-mode allowlist, retyped so drift in either direction is caught.
 SPEC_ALLOWLIST = {
     "Name",
+    "SRConvert",
     "FaderLevel",
     "Pan",
     "Pan2",
@@ -521,6 +523,110 @@ def test_release_is_allowed_when_the_stored_level_is_safe(name: str) -> None:
     assert gate("safe").check_write(target, False, context=cool) is False
 
 
+@pytest.mark.parametrize("name", ["Mute", "DimOn"])
+def test_release_on_an_identified_monitor_fails_closed_without_a_level(name: str) -> None:
+    """B1: is_monitor=True turns a missing level into a FAILED READ, so the release is refused."""
+    blind = WriteContext(reason="open the mix", is_monitor=True)
+    with pytest.raises(SafetyRefusal) as excinfo:
+        gate("safe").check_write(prop(f"{MONITOR}/{name}", "bool", True), False, context=blind)
+    message = str(excinfo.value)
+    assert "CRMonitorLevel" in message
+    assert MONITOR in message
+    assert_names_remedy(message)
+
+
+@pytest.mark.parametrize("name", ["Mute", "DimOn"])
+def test_release_on_an_unidentified_strip_is_still_allowed(name: str) -> None:
+    """Ordinary channel mutes must not be caught by the monitor rail's fail-closed branch."""
+    plain = WriteContext(reason="unmute a channel")
+    target = prop(f"{INPUT}/{name}", "bool", True)
+    assert gate("safe").check_write(target, False, context=plain) is False
+
+
+@pytest.mark.parametrize("spelling", [False, 0, 0.0, "0", "false", "False", "no", "n", "off", "F"])
+def test_every_spelling_of_false_is_a_monitor_release(spelling: Any) -> None:
+    """The rail must fire on whatever the gate will COERCE to False, not just on ``False``."""
+    assert coerces_to_false(spelling) is True
+    hot = WriteContext(reason="unmute", monitor_level_db=-2.0, is_monitor=True)
+    with pytest.raises(SafetyRefusal) as excinfo:
+        gate("safe").check_write(prop(f"{MONITOR}/Mute", "bool", True), spelling, context=hot)
+    assert ENV_MAX_MONITOR_DB in str(excinfo.value)
+
+
+@pytest.mark.parametrize("spelling", [True, 1, "1", "true", "yes", "y", "on"])
+def test_engaging_spellings_are_not_treated_as_a_release(spelling: Any) -> None:
+    assert coerces_to_false(spelling) is False
+    hot = WriteContext(reason="mute", monitor_level_db=-2.0, is_monitor=True)
+    assert gate("safe").check_write(prop(f"{MONITOR}/Mute", "bool", False), spelling, context=hot)
+
+
+def dim_attenuation(value: int = 17) -> UAProperty:
+    return prop("/devices/0/DimAttenuation", "int", value, minimum=0.0, maximum=60.0)
+
+
+def test_raising_the_dim_attenuation_never_needs_context() -> None:
+    assert gate("safe").check_write(dim_attenuation(17), 30, context="deeper dim") == 30
+
+
+def test_lowering_the_dim_attenuation_is_free_while_dim_is_off() -> None:
+    off = WriteContext(reason="prep", dim_on=False, is_monitor=True)
+    assert gate("safe").check_write(dim_attenuation(17), 0, context=off) == 0
+
+
+def test_lowering_the_dim_attenuation_is_railed_while_dim_is_on() -> None:
+    """B2: level 0 dB dimmed by 17 dB is safe; taking the dim away exposes 0 dB. Refuse."""
+    dimmed = WriteContext(reason="un-dim by stealth", dim_on=True, monitor_level_db=0.0)
+    with pytest.raises(SafetyRefusal) as excinfo:
+        gate("safe").check_write(dim_attenuation(17), 0, context=dimmed)
+    message = str(excinfo.value)
+    assert ENV_MAX_MONITOR_DB in message
+    assert "un-dim" in message
+    # The same write is fine when what it exposes is under the ceiling.
+    quiet = WriteContext(reason="un-dim", dim_on=True, monitor_level_db=-22.0)
+    assert gate("safe").check_write(dim_attenuation(17), 0, context=quiet) == 0
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        WriteContext(reason="dim state unknown", monitor_level_db=0.0),
+        WriteContext(reason="level unreadable", dim_on=True),
+        WriteContext(reason="nothing known at all"),
+    ],
+)
+def test_lowering_the_dim_attenuation_fails_closed_when_the_reads_fail(
+    context: WriteContext,
+) -> None:
+    with pytest.raises(SafetyRefusal) as excinfo:
+        gate("safe").check_write(dim_attenuation(17), 6, context=context)
+    message = str(excinfo.value)
+    assert "DimOn" in message and "CRMonitorLevel" in message
+    assert_names_remedy(message)
+
+
+def test_dim_attenuation_with_an_unreadable_current_value_is_treated_as_a_decrease() -> None:
+    """If we cannot prove the write is an increase, it must be railed like a decrease."""
+    blind = prop("/devices/0/DimAttenuation", "int", None, minimum=0.0, maximum=60.0)
+    with pytest.raises(SafetyRefusal):
+        gate("safe").check_write(blind, 60, context=WriteContext(reason="unknown current"))
+    dimmed = WriteContext(reason="unknown current", dim_on=True, monitor_level_db=0.0)
+    with pytest.raises(SafetyRefusal) as excinfo:
+        gate("safe").check_write(blind, 3, context=dimmed)
+    assert ENV_MAX_MONITOR_DB in str(excinfo.value)
+    # Dim is off, so nothing is in circuit and the write is harmless whatever the old value was.
+    off = WriteContext(reason="unknown current", dim_on=False)
+    assert gate("safe").check_write(blind, 60, context=off) == 60
+
+
+def test_dim_attenuation_partial_reduction_uses_the_exposed_level() -> None:
+    """-20 dB dimmed 17 dB is -37; cutting the dim to 6 dB exposes -26, still under the ceiling."""
+    dimmed = WriteContext(reason="less dim", dim_on=True, monitor_level_db=-20.0)
+    assert gate("safe").check_write(dim_attenuation(17), 6, context=dimmed) == 6
+    hot = WriteContext(reason="less dim", dim_on=True, monitor_level_db=-4.0)
+    with pytest.raises(SafetyRefusal):
+        gate("safe").check_write(dim_attenuation(17), 0, context=hot)
+
+
 def test_check_monitor_unmute_is_callable_on_its_own() -> None:
     barrier = gate("safe")
     assert barrier.check_monitor_unmute(-20.0) is None
@@ -557,12 +663,45 @@ def test_token_bucket_allows_a_burst_of_twenty_then_refuses() -> None:
         barrier.check_write(fader(), -6.0, context="refilled to burst")
 
 
-def test_refused_writes_do_not_spend_rate_limit_tokens() -> None:
-    barrier = gate("readonly", write_burst=1)
+def test_refused_writes_spend_a_token_too() -> None:
+    """A refusal still costs a read and a decision, so hammering a closed gate is not free."""
+    clock = FakeClock()
+    barrier = gate("safe", write_burst=1, clock=clock)
+    off_allowlist = prop(f"{INPUT}/Isolate", "bool", False)
+
+    with pytest.raises(SafetyRefusal) as first:
+        barrier.check_write(off_allowlist, True, context="off allowlist")
+    assert "not in the safe-mode allowlist" in str(first.value)
+
+    with pytest.raises(SafetyRefusal) as second:
+        barrier.check_write(off_allowlist, True, context="again")
+    assert "write rate limit reached" in str(second.value), "the refusal spent the only token"
+
+    clock.advance(1.0)
+    with pytest.raises(SafetyRefusal) as refilled:
+        barrier.check_write(off_allowlist, True, context="refilled")
+    assert "not in the safe-mode allowlist" in str(refilled.value)
+
+
+def test_readonly_mode_never_degrades_into_a_rate_limit_message() -> None:
+    """No wait unblocks readonly mode, so never answer a readonly write with 'retry in 0.1 s'."""
+    barrier = gate("readonly", write_burst=1, clock=FakeClock())
     for _ in range(50):
-        with pytest.raises(SafetyRefusal):
-            barrier.check_write(fader(), -6.0, context="readonly")
-    assert barrier.mode == "readonly"
+        with pytest.raises(SafetyRefusal) as excinfo:
+            barrier.check_write(fader(), -6.0, context="hammering")
+        assert "safety mode is 'readonly'" in str(excinfo.value)
+        assert "rate limit" not in str(excinfo.value)
+
+
+def test_denylisted_writes_are_free_and_keep_naming_the_denylist() -> None:
+    barrier = gate("full", write_burst=1, clock=FakeClock())
+    denied = prop("/devices/0/DeviceHwID", "int", 0)
+    for _ in range(50):
+        with pytest.raises(SafetyRefusal) as excinfo:
+            barrier.check_write(denied, 1, context="hammering")
+        assert "permanent denylist" in str(excinfo.value)
+    # The bucket was never touched, so real work still gets its full burst.
+    assert barrier.check_write(fader(), -6.0, context="real work") == -6.0
 
 
 # ------------------------------------------------------------------------- confirm gates
@@ -653,6 +792,19 @@ def _every_refusal() -> list[str]:
             False,
             WriteContext(reason="unmute", monitor_level_db=-1.0),
         ),
+        (
+            gate("safe"),
+            prop(f"{MONITOR}/DimOn", "bool", True),
+            False,
+            WriteContext(reason="un-dim blind", is_monitor=True),
+        ),
+        (
+            gate("safe"),
+            dim_attenuation(17),
+            0,
+            WriteContext(reason="un-dim by stealth", dim_on=True, monitor_level_db=0.0),
+        ),
+        (gate("safe"), dim_attenuation(17), 0, WriteContext(reason="dim state unknown")),
     ]
     for barrier, target, value, context in scenarios:
         with pytest.raises(SafetyRefusal) as excinfo:

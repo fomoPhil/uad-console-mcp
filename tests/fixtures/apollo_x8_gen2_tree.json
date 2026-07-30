@@ -210,7 +210,7 @@
     },
     "SerialNumber": {
      "type": "string",
-     "value": "24492087001847"
+     "value": "0"
     },
     "CueBusCount": {
      "type": "int",

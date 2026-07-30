@@ -51,6 +51,8 @@ AUDIO_FLOWING_DB = -60.0
 
 MONITOR_LEVEL_PROPERTY = "CRMonitorLevel"
 PHANTOM_POWER_PROPERTY = "48V"
+DIM_ATTENUATION_PROPERTY = "DimAttenuation"
+DIM_ON_PROPERTY = "DimOn"
 MONITOR_RELEASE_PROPERTIES = ("Mute", "DimOn")
 """Setting these to false releases an attenuation, so they are monitor level events."""
 
@@ -90,6 +92,7 @@ WRITABLE_PROPERTIES: frozenset[str] = frozenset(
         "StereoName",
         "Stereo",
         "EnabledByUser",
+        "SRConvert",
     }
 )
 """Property names writable in ``safe`` mode. Everything else needs ``UAD_MCP_MODE=full``."""
@@ -171,6 +174,17 @@ class WriteContext:
 
     monitor_level_db: float | None = None
     """Stored monitor level, so unmute/un-dim writes can be checked against the ceiling."""
+
+    is_monitor: bool = False
+    """True when the target strip really is a control-room monitor.
+
+    The gate cannot see topology. With this set, a missing :attr:`monitor_level_db` is a FAILED
+    level read rather than "not a monitor", so the release is refused instead of allowed.
+    """
+
+    dim_on: bool | None = None
+    """Live ``DimOn`` state, so a ``DimAttenuation`` decrease can be railed. ``None`` means
+    "not read", which fails closed for a decrease."""
 
     def __str__(self) -> str:
         return self.reason
@@ -282,6 +296,21 @@ def property_name(path: str) -> str:
     if len(parts) > 1 and parts[-1] == "value":
         return parts[-2]
     return parts[-1]
+
+
+def coerces_to_false(value: Any) -> bool:
+    """Would :meth:`SafetyGate.check_write` read ``value`` as ``False``?
+
+    The one definition of "this write is a release". Callers that decide whether a ``Mute`` or
+    ``DimOn`` write needs the monitor rail MUST use this rather than ``value is False``: the gate
+    coerces ``0``, ``"no"``, ``"n"``, ``"off"`` and friends, so an identity test on ``False``
+    lets exactly those spellings past the rail.
+    """
+    if isinstance(value, bool):
+        return value is False
+    if _is_number(value):
+        return float(value) == 0.0
+    return isinstance(value, str) and value.strip().casefold() in _FALSY
 
 
 def _refuse(reason: str, remedy: str) -> NoReturn:
@@ -442,12 +471,19 @@ class SafetyGate:
         name = property_name(path)
         because = f" ({ctx.reason})" if ctx.reason else ""
 
+        # These two are permanent, global and free to evaluate. They are answered BEFORE the token
+        # bucket so a caller in readonly mode (or hammering the denylist) always gets the message
+        # that names its real blocker, instead of "retry in 0.1 s" for something no wait can fix.
         if self._mode == "readonly":
             _refuse(f"Refused write to {path}{because}: safety mode is 'readonly'.", _MODE_REMEDY)
 
         denial = _denial_reason(name, path)
         if denial is not None:
             _refuse(f"Refused write to {path}{because}: {denial}", _NO_UNBLOCK)
+
+        # Everything below this line costs a token whether it is allowed or refused: the caller
+        # already spent a property read to get here, so refusals must not be free.
+        self._consume_token(path)
 
         if getattr(prop, "readonly", False) and not self._allow_readonly_writes:
             _refuse(
@@ -471,18 +507,11 @@ class SafetyGate:
 
         if name == MONITOR_LEVEL_PROPERTY:
             value = self._check_monitor_level_write(prop, value)
-        elif name in MONITOR_RELEASE_PROPERTIES and value is False:
-            if ctx.monitor_level_db is not None:
-                action = "un-dim" if name == "DimOn" else "unmute"
-                self.check_monitor_unmute(ctx.monitor_level_db, action=action)
-            else:
-                logger.debug(
-                    "%s released without monitor_level_db in context; "
-                    "call check_monitor_unmute() from the tool layer for monitor outputs",
-                    path,
-                )
+        elif name == DIM_ATTENUATION_PROPERTY:
+            self._check_dim_attenuation(prop, value, ctx, because)
+        elif name in MONITOR_RELEASE_PROPERTIES and coerces_to_false(value):
+            self._check_monitor_release(name, path, ctx, because)
 
-        self._consume_token(path)
         return value
 
     def validate_value(self, prop: PropertyLike, new_value: Any) -> Any:
@@ -599,6 +628,64 @@ class SafetyGate:
                 "Stop playback and recording, then retry with confirm=True and "
                 "audio_flowing=False.",
             )
+
+    def _check_monitor_release(
+        self, name: str, path: str, ctx: WriteContext, because: str
+    ) -> None:
+        """Rail an unmute / un-dim, failing CLOSED when the level behind it is unknown."""
+        action = "un-dim" if name == DIM_ON_PROPERTY else "unmute"
+        if ctx.monitor_level_db is not None:
+            self.check_monitor_unmute(ctx.monitor_level_db, action=action)
+            return
+        if ctx.is_monitor:
+            _refuse(
+                f"Refused to {action} the monitor output at {path}{because}: reading its stored "
+                f"{MONITOR_LEVEL_PROPERTY} failed, so the level this release would jump straight "
+                "to is unknown.",
+                f"Read {MONITOR_LEVEL_PROPERTY} on that strip successfully and pass it in the "
+                f"write context, or lower it explicitly first; no {ENV_MODE} value and no confirm "
+                "flag bypasses a failed monitor level read.",
+            )
+        logger.debug(
+            "%s released on a strip the tool layer did not identify as a monitor; "
+            "pass is_monitor=True plus monitor_level_db for control-room outputs",
+            path,
+        )
+
+    def _check_dim_attenuation(
+        self, prop: PropertyLike, value: Any, ctx: WriteContext, because: str
+    ) -> None:
+        """A DECREASE of the dim attenuation while dim is engaged is an un-dim: rail it.
+
+        Increasing the attenuation only ever makes the control room quieter, so it is always
+        allowed. Lowering it while ``DimOn`` is true raises the real acoustic level by exactly
+        that many dB, which is the same event as releasing the dim.
+        """
+        if not _is_number(value):
+            return
+        attenuation = float(value)
+        current = float(prop.value) if _is_number(prop.value) else None
+        if current is not None and attenuation >= current - _EPSILON:
+            return
+        if ctx.dim_on is False:
+            return
+        if ctx.dim_on is None or ctx.monitor_level_db is None:
+            failed = " and ".join(
+                name
+                for name, known in (
+                    (DIM_ON_PROPERTY, ctx.dim_on is not None),
+                    (MONITOR_LEVEL_PROPERTY, ctx.monitor_level_db is not None),
+                )
+                if not known
+            )
+            _refuse(
+                f"Refused to lower {prop.path}{because} to {attenuation:g} dB: reading {failed} "
+                "failed, so the level this un-dim would expose is unknown.",
+                f"Read {DIM_ON_PROPERTY} and {MONITOR_LEVEL_PROPERTY} on the monitor output "
+                f"successfully and pass them, or raise the attenuation instead; no {ENV_MODE} "
+                "value and no confirm flag bypasses a failed monitor level read.",
+            )
+        self.check_monitor_unmute(ctx.monitor_level_db - attenuation, action="un-dim")
 
     def _check_monitor_level_write(self, prop: PropertyLike, target: Any) -> float:
         current = prop.value

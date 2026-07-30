@@ -39,7 +39,7 @@ markers = [
   "live: requires a real UA Mixer Engine + Apollo attached (never run in CI)",
   "slow: long-running soak tests",
 ]
-addopts = "-m 'not live'"
+addopts = "-m 'not live and not slow'"
 
 [tool.ruff]
 line-length = 100

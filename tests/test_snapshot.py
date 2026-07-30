@@ -325,6 +325,84 @@ def test_monitor_entries_are_skipped_unless_opted_in() -> None:
     assert opted_in.skipped == []
 
 
+def test_monitor_exclusion_can_be_driven_from_the_live_rig() -> None:
+    """M8: a document that does not know a strip is the monitor must not defeat the rail."""
+    blind_doc = {
+        "channels": [{**MONITOR_CHANNEL, "is_monitor": False}],
+        "entries": [
+            {"path": MONITOR_LEVEL, "value": -20.0},
+            {"path": f"{MONITOR}/Mute", "value": False},
+        ],
+    }
+    # Straight from the doc, both entries look like ordinary channel writes.
+    assert len(snap.plan_restore(blind_doc).writes) == 2
+    # Told what the live rig knows, they are monitor-rail entries again.
+    railed = snap.plan_restore(blind_doc, monitor_paths=[MONITOR])
+    assert railed.writes == []
+    assert {item["path"] for item in railed.skipped} == {MONITOR_LEVEL, f"{MONITOR}/Mute"}
+
+
+def test_root_talkback_entries_are_restored_last() -> None:
+    """m3: talkback lives at "/", is captured, and lands after every strip is in place."""
+    doc = {
+        "channels": [MONITOR_CHANNEL],
+        "entries": [
+            {"path": "/TalkbackOn", "value": False},
+            {"path": "/TalkbackMaster", "value": 50},
+            {"path": f"{IN0}/Mute", "value": False},
+        ],
+    }
+    plan = snap.plan_restore(doc, include_monitor=True)
+    assert [(write.phase.name, write.path) for write in plan.writes] == [
+        ("CHANNEL", f"{IN0}/Mute"),
+        ("ROOT", "/TalkbackMaster"),
+        ("ROOT", "/TalkbackOn"),
+    ]
+
+
+@pytest.mark.parametrize("was_on", [True, 1, "true"])
+def test_a_restore_never_opens_the_talkback_mic(was_on: Any) -> None:
+    """A snapshot taken with talkback open must not reopen it: there is no auto-off timer here."""
+    doc = {
+        "channels": [],
+        "entries": [{"path": "/TalkbackOn", "value": was_on}],
+    }
+    plan = snap.plan_restore(doc)
+    assert plan.writes == []
+    assert plan.skipped[0]["path"] == "/TalkbackOn"
+    assert "uad_talkback(on=true)" in plan.skipped[0]["reason"]
+
+
+@pytest.mark.parametrize("off", [False, 0, "false"])
+def test_a_restore_always_closes_the_talkback_mic(off: Any) -> None:
+    doc = {"channels": [], "entries": [{"path": "/TalkbackOn", "value": off}]}
+    plan = snap.plan_restore(doc)
+    assert [write.value for write in plan.writes] == [off]
+    assert plan.skipped == []
+
+
+@pytest.mark.parametrize("muted_off", [False, 0, "no"])
+def test_a_monitor_release_spelled_any_other_way_is_still_monitor_railed(muted_off: Any) -> None:
+    """The rail keys on what the gate COERCES to False, not on the literal ``False``."""
+    doc = {
+        "channels": [MONITOR_CHANNEL],
+        "entries": [{"path": f"{MONITOR}/Mute", "value": muted_off}],
+    }
+    plan = snap.plan_restore(doc)
+    assert plan.writes == []
+    assert plan.skipped[0]["path"] == f"{MONITOR}/Mute"
+    assert "include_monitor" in plan.skipped[0]["reason"]
+
+
+def test_root_entries_survive_a_cross_model_remap() -> None:
+    doc = {
+        "channels": [MONITOR_CHANNEL],
+        "entries": [{"path": "/TalkbackOn", "value": False}],
+    }
+    assert snap._remap_path("/TalkbackOn", [], {}, {}) == "/TalkbackOn"
+    assert paths_of(write.as_dict() for write in snap.plan_restore(doc).writes) == ["/TalkbackOn"]
+
+
 def test_stereo_is_unlinked_only_when_it_is_actually_linked() -> None:
     entries = [
         {"path": f"{STEREO_INPUT}/Stereo", "value": True},
@@ -491,6 +569,97 @@ async def test_restore_runs_the_monitor_level_through_the_rail(mock: MockEngine)
     assert applied, "the monitor level should have been restored"
     assert applied[0]["after"] == -54.0, "clamped to +6 dB per call, not straight to -22 dB"
     assert mock.value(MONITOR_LEVEL) == -54.0
+
+
+async def test_restore_rails_a_monitor_release_it_only_learns_about_from_the_rig(
+    mock: MockEngine,
+) -> None:
+    """M8: the live rig's monitor strips are honoured even when the document forgot them."""
+    async with connected(mock) as (client, rig):
+        doc = await snap.capture(client, rig)
+        assert snap.monitor_paths_for(doc, rig) == (MONITOR,)
+        for channel in doc["channels"]:
+            channel["is_monitor"] = False  # a document that does not know what it captured
+        await mock.push(MONITOR_LEVEL, -2.0)
+        await mock.push(f"{MONITOR}/Mute", True)
+        result = await snap.restore(
+            client, rig, doc, gate=gate(), dry_run=False, pre_restore=False
+        )
+    monitor_writes = [
+        item
+        for group in ("applied", "failed")
+        for item in result[group]
+        if item["path"].startswith(MONITOR + "/")
+    ]
+    assert monitor_writes == [], f"monitor entries must be excluded, not written: {monitor_writes}"
+    assert any(item["path"] == f"{MONITOR}/Mute" for item in result["skipped"])
+    assert mock.value(f"{MONITOR}/Mute") is True
+
+
+async def test_restore_rails_a_release_stored_as_zero_rather_than_false(
+    mock: MockEngine,
+) -> None:
+    """A doc holding ``Mute: 0`` is still a release: the gate coerces it, so the rail must too."""
+    async with connected(mock) as (client, rig):
+        await mock.push(MONITOR_LEVEL, -2.0)
+        doc = await snap.capture(client, rig)
+        entry = entry_for(doc, f"{MONITOR}/Mute")
+        assert entry is not None
+        entry["value"] = 0
+        # The snapshot agrees with the live hot level, so no level write precedes the release.
+        assert entry_for(doc, MONITOR_LEVEL)["value"] == -2.0  # type: ignore[index]
+        await mock.push(f"{MONITOR}/Mute", True)
+        result = await snap.restore(
+            client,
+            rig,
+            doc,
+            gate=gate(),
+            dry_run=False,
+            include_monitor=True,
+            pre_restore=False,
+        )
+    failed = [item for item in result["failed"] if item["path"] == f"{MONITOR}/Mute"]
+    assert failed, f"the un-mute should have been refused: {result['applied']}"
+    assert "UAD_MCP_MAX_MONITOR_DB" in failed[0]["error"]
+    assert mock.value(f"{MONITOR}/Mute") is True
+
+
+async def test_restore_puts_talkback_back(mock: MockEngine) -> None:
+    """m3: talkback at "/" is captured, so a snapshot really does hold everything writable."""
+    async with connected(mock) as (client, rig):
+        doc = await snap.capture(client, rig)
+        assert entry_for(doc, "/TalkbackOn") == {
+            "path": "/TalkbackOn",
+            "value": False,
+            "meta": {"type": "bool"},
+        }
+        assert entry_for(doc, "/TalkbackMaster") is not None
+        await mock.push("/TalkbackOn", True)
+        await mock.push("/TalkbackMaster", 90)
+        result = await snap.restore(
+            client, rig, doc, gate=gate(), dry_run=False, pre_restore=False
+        )
+    applied = {item["path"]: item for item in result["applied"]}
+    assert applied["/TalkbackOn"]["after"] is False
+    assert applied["/TalkbackOn"]["phase"] == "root"
+    assert applied["/TalkbackMaster"]["after"] == 0
+    assert mock.value("/TalkbackOn") is False
+
+
+async def test_restoring_a_snapshot_taken_with_talkback_open_leaves_it_shut(
+    mock: MockEngine,
+) -> None:
+    async with connected(mock) as (client, rig):
+        await mock.push("/TalkbackOn", True)
+        doc = await snap.capture(client, rig)
+        assert entry_for(doc, "/TalkbackOn")["value"] is True  # type: ignore[index]
+        await mock.push("/TalkbackOn", False)
+        result = await snap.restore(
+            client, rig, doc, gate=gate(), dry_run=False, pre_restore=False
+        )
+    assert mock.value("/TalkbackOn") is False, "a restore must never open a live mic"
+    skipped = [item for item in result["skipped"] if item["path"] == "/TalkbackOn"]
+    assert skipped and "uad_talkback(on=true)" in skipped[0]["reason"]
 
 
 async def test_restore_refuses_the_transport_without_an_audio_check(mock: MockEngine) -> None:

@@ -47,10 +47,14 @@ from .discovery import (
 )
 from .safety import (
     AUDIO_FLOWING_DB,
+    DIM_ATTENUATION_PROPERTY,
+    DIM_ON_PROPERTY,
     MONITOR_LEVEL_PROPERTY,
+    MONITOR_RELEASE_PROPERTIES,
     SafetyGate,
     SafetyRefusal,
     WriteContext,
+    coerces_to_false,
     gate_from_env,
     property_name,
 )
@@ -61,7 +65,15 @@ logger = logging.getLogger("uad_console_mcp.server")
 SERVER_NAME = "uad-console"
 
 RIG_TTL_S = 30.0
+RIG_WALK_ATTEMPTS = 3
+"""How many times a topology walk may be re-run because it was invalidated while running."""
+
 TALKBACK_AUTO_OFF_S = 30.0
+TALKBACK_ON_PATH = "/TalkbackOn"
+TALKBACK_MASTER_PATH = "/TalkbackMaster"
+TALKBACK_AUTO_OFF_RETRY_DELAYS_S: tuple[float, ...] = (1.0, 2.0, 4.0)
+"""Backoff between auto-off attempts. Its length is the number of attempts."""
+
 CLOCK_VERIFY_DELAY_S = 2.5
 WATCH_MAX_DURATION_S = 30.0
 WATCH_MIN_INTERVAL_S = 0.1
@@ -96,8 +108,10 @@ that API, not missing features.
   safe-mode allowlist. Use `uad_raw_get` to inspect it; re-routing needs UAD Console itself.
 - **Channels cannot be created or deleted.** The strip list is fixed by the hardware model.
 - **Monitor level is capped** by `UAD_MCP_MAX_MONITOR_DB` (default -6 dB), with at most +6 dB per
-  call and +10 dB per 30 s. Unmuting or un-dimming onto an above-ceiling stored level is refused.
-  Lower the stored level first.
+  call and +10 dB per 30 s. Unmuting or un-dimming onto an above-ceiling stored level is refused,
+  and so is *lowering* `dim_attenuation_db` while dim is on, because that exposes the same level.
+  Lower the stored level first. If the stored level cannot be read, the release is refused rather
+  than guessed at.
 
 ## Metering
 - **A meter sitting exactly at the floor (-77 dB) cannot tell silence from a dead link.** On an
@@ -120,9 +134,12 @@ that API, not missing features.
 ## Sessions and scenes
 - **Console sessions and plugin scenes cannot be saved or recalled.** Writes under
   `/pluginscenes` are permanently denied. Use `uad_snapshot` instead: it captures every property
-  this server may write and restores them in a safe order.
+  this server may write - every strip under `/devices`, plus the engine-wide talkback pair
+  (`TalkbackOn`, `TalkbackMaster`) - and restores them in a safe order, talkback last.
 - Snapshots do not restore clock source or sample rate unless you ask for it, and never restore
-  the monitor rail unless you ask for it.
+  the monitor rail unless you ask for it. Talkback that was ON when the snapshot was taken is
+  never switched back on by a restore either (that would open a live mic with no auto-off timer);
+  use `uad_talkback(on=true)`, which arms one.
 
 ## Transport
 - **Clock source and sample rate changes re-lock the whole chain.** Both refuse while audio is
@@ -198,6 +215,7 @@ class ServerContext:
         snapshots: SnapshotStore | None = None,
         rig_ttl_s: float = RIG_TTL_S,
         talkback_auto_off_s: float = TALKBACK_AUTO_OFF_S,
+        talkback_retry_delays_s: Sequence[float] = TALKBACK_AUTO_OFF_RETRY_DELAYS_S,
         clock_verify_delay_s: float = CLOCK_VERIFY_DELAY_S,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -206,13 +224,18 @@ class ServerContext:
         self.snapshots = snapshots if snapshots is not None else SnapshotStore()
         self.rig_ttl_s = rig_ttl_s
         self.talkback_auto_off_s = talkback_auto_off_s
+        self.talkback_retry_delays_s = tuple(talkback_retry_delays_s)
         self.clock_verify_delay_s = clock_verify_delay_s
         self._clock = clock
         self._rig: Rig | None = None
         self._rig_at = 0.0
         self._rig_lock = asyncio.Lock()
+        #: Bumped by :meth:`invalidate`, so a walk that raced a reconnect can be discarded.
+        self._rig_generation = 0
         #: How many times the topology has actually been walked (diagnostics + tests).
         self.discoveries = 0
+        #: True when the talkback auto-off timer fired and could not turn talkback off.
+        self.talkback_auto_off_failed = False
         self._catalog: list[dict[str, Any]] | None = None
         self._catalog_at = 0.0
         self._talkback_task: asyncio.Task[None] | None = None
@@ -221,14 +244,38 @@ class ServerContext:
     # ------------------------------------------------------------------- topology cache
 
     async def rig(self, *, refresh: bool = False) -> Rig:
-        """The cached topology, rediscovered when stale, on request, or after a reconnect."""
+        """The cached topology, rediscovered when stale, on request, or after a reconnect.
+
+        A reconnect during the walk invalidates it: the result describes a mix of before and
+        after, so it is thrown away and re-walked rather than cached with a stale timestamp.
+        """
         async with self._rig_lock:
-            now = self._clock()
-            fresh = self._rig is not None and (now - self._rig_at) <= self.rig_ttl_s
+            fresh = self._rig is not None and (self._clock() - self._rig_at) <= self.rig_ttl_s
             if refresh or not fresh:
-                self._rig = await discover(self.client)
-                self._rig_at = now
-                self.discoveries += 1
+                settled = False
+                for attempt in range(1, max(1, RIG_WALK_ATTEMPTS) + 1):
+                    generation = self._rig_generation
+                    walked = await discover(self.client)
+                    self.discoveries += 1
+                    settled = generation == self._rig_generation
+                    if settled:
+                        break
+                    logger.info(
+                        "topology was invalidated during walk %d/%d; discarding it and re-walking",
+                        attempt,
+                        RIG_WALK_ATTEMPTS,
+                    )
+                self._rig = walked
+                # Stamped AFTER the walk: a long walk must not start out already half-expired.
+                # A walk we never managed to take cleanly is served once and then re-walked,
+                # never cached for the full TTL.
+                self._rig_at = self._clock() if settled else float("-inf")
+                if not settled:
+                    logger.warning(
+                        "topology kept being invalidated across %d walks; serving the last one "
+                        "without caching it",
+                        RIG_WALK_ATTEMPTS,
+                    )
             assert self._rig is not None
             return self._rig
 
@@ -241,6 +288,7 @@ class ServerContext:
         """Drop the topology and plugin caches (reconnect, or a channel count that changed)."""
         self._rig = None
         self._catalog = None
+        self._rig_generation += 1
 
     async def _on_reconnect(self) -> None:
         logger.info("control socket reconnected: dropping the topology cache")
@@ -318,6 +366,9 @@ class ServerContext:
             warnings.append(f"the engine reports {after!r} after writing {gated!r}")
         if name == MONITOR_LEVEL_PROPERTY and isinstance(after, int | float):
             self.gate.note_monitor_event(float(after))
+        if path == TALKBACK_ON_PATH and verified and gated is False:
+            # Talkback is shut, whoever shut it: a previously failed auto-off is history.
+            self.talkback_auto_off_failed = False
         return {
             "path": path,
             "property": name,
@@ -347,6 +398,7 @@ class ServerContext:
     def arm_talkback_auto_off(self, seconds: float) -> None:
         """(Re)start the auto-off timer. A second call replaces the first one's deadline."""
         self.cancel_talkback_auto_off()
+        self.talkback_auto_off_failed = False
         self._talkback_task = asyncio.create_task(
             self._talkback_auto_off(seconds), name="uad-talkback-auto-off"
         )
@@ -363,16 +415,51 @@ class ServerContext:
         return task is not None and not task.done()
 
     async def _talkback_auto_off(self, seconds: float) -> None:
+        """Close talkback after ``seconds``, retrying with backoff before giving up loudly.
+
+        An open talkback mic is a live path into the control room, so a single failed write
+        (a dropped socket, the rate limiter) must not silently end the attempt. If every retry
+        fails, :attr:`talkback_auto_off_failed` is set and surfaced by ``uad_get_status``.
+        """
+        await asyncio.sleep(max(0.0, seconds))
+        delays = self.talkback_retry_delays_s or (0.0,)
+        for attempt, delay in enumerate(delays, start=1):
+            try:
+                await self.write(
+                    TALKBACK_ON_PATH,
+                    False,
+                    context=WriteContext(reason="talkback auto-off timeout"),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "talkback auto-off attempt %d/%d failed: %s", attempt, len(delays), exc
+                )
+                if attempt < len(delays):
+                    await asyncio.sleep(delay)
+                continue
+            logger.info("talkback auto-off fired after %.1fs (attempt %d)", seconds, attempt)
+            self.talkback_auto_off_failed = False
+            return
+        # Before alarming, check whether the mic is even open: when the original TalkbackOn
+        # write never reached the engine, every retry fails too, and flagging that case would
+        # be a false alarm on the one flag an operator must be able to trust.
         try:
-            await asyncio.sleep(max(0.0, seconds))
-            await self.write(
-                "/TalkbackOn", False, context=WriteContext(reason="talkback auto-off timeout")
+            still_on = bool(await self.client.get_value(TALKBACK_ON_PATH))
+        except Exception:
+            still_on = True  # cannot read it either: assume the worst
+        self.talkback_auto_off_failed = still_on
+        if still_on:
+            logger.error(
+                "talkback auto-off gave up after %d attempts: talkback may still be ON",
+                len(delays),
             )
-            logger.info("talkback auto-off fired after %.1fs", seconds)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning("talkback auto-off could not turn talkback off: %s", exc)
+        else:
+            logger.warning(
+                "talkback auto-off could not write, but TalkbackOn already reads false; "
+                "no alarm raised"
+            )
 
     # ------------------------------------------------------------------ plugin catalog
 
@@ -448,6 +535,21 @@ def _item_error(item: Mapping[str, Any], message: str) -> dict[str, Any]:
     return {"target": item.get("target"), "ok": False, "error": message}
 
 
+async def _monitor_rail_state(
+    ctx: ServerContext, strip_path: str
+) -> tuple[float | None, bool | None]:
+    """``(stored level, DimOn)`` for a monitor strip. ``None`` for either means the read failed.
+
+    A failed read is not the same as "no rail applies": the gate is told the strip IS a monitor
+    (``is_monitor=True``) so a missing level refuses the write instead of waving it through.
+    """
+    level_path = f"{strip_path}/{MONITOR_LEVEL_PROPERTY}"
+    dim_path = f"{strip_path}/{DIM_ON_PROPERTY}"
+    values = await ctx.poll([level_path, dim_path])
+    raw_dim = values.get(dim_path)
+    return _number(values.get(level_path)), raw_dim if isinstance(raw_dim, bool) else None
+
+
 _CHANNEL_FIELDS: tuple[tuple[str, str], ...] = (
     ("name", "Name"),
     ("fader_db", "FaderLevel"),
@@ -518,6 +620,7 @@ async def tool_get_status(ctx: ServerContext) -> dict[str, Any]:
             "on": root_value("TalkbackOn"),
             "level": root_value("TalkbackMaster"),
             "auto_off_timer_running": ctx.talkback_timer_running,
+            "auto_off_failed": ctx.talkback_auto_off_failed,
         },
         "devices": devices,
         "safety": ctx.gate.describe(),
@@ -544,14 +647,18 @@ async def tool_list_channels(
         ("pan", "Pan"),
         ("hidden", "ChannelHidden"),
         ("stereo", "Stereo"),
-        ("monitor_level_db", MONITOR_LEVEL_PROPERTY),
     )
+    monitor_field = ("monitor_level_db", MONITOR_LEVEL_PROPERTY)
+    # Only control-room outputs carry CRMonitorLevel; asking every strip for it wastes a whole
+    # extra poll entry per channel (56 on an x8) that can never answer.
     values = await ctx.poll(
         [f"{c.path}/{prop}" for c in channels for _, prop in fields]
+        + [f"{c.path}/{monitor_field[1]}" for c in channels if c.is_monitor]
     )
     grouped: dict[int, list[dict[str, Any]]] = {}
     for channel in channels:
-        live = {key: values.get(f"{channel.path}/{prop}") for key, prop in fields}
+        wanted = (*fields, monitor_field) if channel.is_monitor else fields
+        live = {key: values.get(f"{channel.path}/{prop}") for key, prop in wanted}
         if not include_hidden and live.get("hidden"):
             continue
         entry: dict[str, Any] = {
@@ -607,7 +714,8 @@ async def tool_set_channels(ctx: ServerContext, items: list[dict[str, Any]]) -> 
             results.append(_item_error(item, error_text(exc, client=ctx.client)))
             continue
         # A monitor strip reached through this tool must still meet the monitor rail: an
-        # unmute here is exactly as loud as an unmute through uad_set_monitor.
+        # unmute here is exactly as loud as an unmute through uad_set_monitor. is_monitor makes
+        # a failed level read a refusal instead of a free pass.
         monitor_level = (
             _number(await ctx.value(f"{channel.path}/{MONITOR_LEVEL_PROPERTY}"))
             if channel.is_monitor
@@ -620,6 +728,7 @@ async def tool_set_channels(ctx: ServerContext, items: list[dict[str, Any]]) -> 
             context = WriteContext(
                 reason=f"uad_set_channels {key} on {channel.label()}",
                 monitor_level_db=monitor_level,
+                is_monitor=channel.is_monitor,
             )
             requests.append((f"{channel.path}/{prop}", item[key], context))
         if not requests:
@@ -796,6 +905,21 @@ async def tool_set_sends(ctx: ServerContext, items: list[dict[str, Any]]) -> dic
             )
             continue
         writes, errors = await ctx.write_many(requests)
+        # cue3/cue4 send nodes exist in the tree even on devices with fewer cue buses; a
+        # write there "succeeds" against a bus the hardware does not have. Warn, loudly.
+        phantom_cue = None
+        if send_id.startswith("cue") and send_id[3:].isdigit():
+            cue_count = rig.device(channel.device).cue_bus_count
+            if int(send_id[3:]) > cue_count:
+                phantom_cue = (
+                    f"{send_id} was written and verified, but this device reports only "
+                    f"{cue_count} cue bus(es), so {send_id} does not reach any real output. "
+                    "Use cue1"
+                    + (f"..cue{cue_count}." if cue_count > 1 else " only.")
+                )
+        if phantom_cue:
+            for write in writes:
+                write["warnings"] = [*write["warnings"], phantom_cue]
         results.append(
             {
                 "target": item.get("target"),
@@ -824,19 +948,50 @@ async def tool_set_monitor(
     dim_attenuation_db: int | None = None,
 ) -> dict[str, Any]:
     """Control-room monitor: level (railed), dim, mute, mono fold, alt speaker set."""
+    if all(
+        value is None
+        for value in (level_db, dim, mute, mono, alt_speaker, dim_attenuation_db)
+    ):
+        raise ValueError(
+            "nothing to change: pass level_db, dim, mute, mono, alt_speaker or "
+            "dim_attenuation_db."
+        )
     rig = await ctx.rig()
     monitor = rig.monitor_output(device)
-    stored = _number(await ctx.value(f"{monitor.path}/{MONITOR_LEVEL_PROPERTY}"))
-    requests: list[tuple[str, Any, WriteContext | str]] = []
-    # Level first: lowering before releasing a mute or a dim is the safe order.
+    stored, dim_on = await _monitor_rail_state(ctx, monitor.path)
+
+    writes: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    # Level FIRST, and on its own: everything below is railed against the level the engine
+    # actually confirmed, never against the level that was merely requested.
+    applied_level = stored
+    release_blocked: str | None = None
     if level_db is not None:
-        requests.append(
-            (
-                f"{monitor.path}/{MONITOR_LEVEL_PROPERTY}",
-                level_db,
-                WriteContext(reason="uad_set_monitor level"),
-            )
+        level_writes, level_errors = await ctx.write_many(
+            [
+                (
+                    f"{monitor.path}/{MONITOR_LEVEL_PROPERTY}",
+                    level_db,
+                    WriteContext(reason="uad_set_monitor level", is_monitor=True),
+                )
+            ]
         )
+        writes.extend(level_writes)
+        errors.extend(level_errors)
+        write = level_writes[0] if level_writes else None
+        # The level to rail against is the one the ENGINE reports back, not the one that was
+        # asked for: that catches an engine which applied something louder, and it does not
+        # block a legitimate quiet unmute just because the engine quantized -35.0 to -34.996.
+        applied_level = _number(write["after"]) if write is not None else None
+        if applied_level is None:
+            release_blocked = (
+                "the monitor level write did not land"
+                if write is None
+                else f"the engine reported no usable monitor level ({write['after']!r})"
+            )
+
+    requests: list[tuple[str, Any, WriteContext | str]] = []
     if mono is not None:
         requests.append(
             (
@@ -846,11 +1001,18 @@ async def tool_set_monitor(
             )
         )
     if dim_attenuation_db is not None:
+        # Lowering the attenuation while dim is engaged is an un-dim by another name, so the
+        # gate gets the confirmed level and the live DimOn state to rail it against.
         requests.append(
             (
-                f"/devices/{monitor.device}/DimAttenuation",
+                f"/devices/{monitor.device}/{DIM_ATTENUATION_PROPERTY}",
                 dim_attenuation_db,
-                WriteContext(reason="uad_set_monitor dim attenuation"),
+                WriteContext(
+                    reason="uad_set_monitor dim attenuation",
+                    monitor_level_db=applied_level,
+                    dim_on=dim_on,
+                    is_monitor=True,
+                ),
             )
         )
     if alt_speaker is not None:
@@ -861,30 +1023,42 @@ async def tool_set_monitor(
                 WriteContext(reason="uad_set_monitor alt speaker"),
             )
         )
-    for value, prop in ((dim, "DimOn"), (mute, "Mute")):
+    more_writes, more_errors = await ctx.write_many(requests)
+    writes.extend(more_writes)
+    errors.extend(more_errors)
+
+    for value, prop in ((dim, DIM_ON_PROPERTY), (mute, "Mute")):
         if value is None:
             continue
-        level_after = level_db if level_db is not None else stored
-        requests.append(
-            (
-                f"{monitor.path}/{prop}",
-                value,
-                WriteContext(
-                    reason=f"uad_set_monitor {prop}",
-                    monitor_level_db=level_after,
-                ),
+        if value is False and release_blocked is not None:
+            errors.append(
+                f"Skipped releasing {prop} on {monitor.label()}: {release_blocked}, so the level "
+                "this release would jump straight to is unknown. Set a level_db that verifies "
+                f"first, then release {prop} in a second call."
             )
+            continue
+        release_writes, release_errors = await ctx.write_many(
+            [
+                (
+                    f"{monitor.path}/{prop}",
+                    value,
+                    WriteContext(
+                        reason=f"uad_set_monitor {prop}",
+                        monitor_level_db=applied_level,
+                        is_monitor=True,
+                    ),
+                )
+            ]
         )
-    if not requests:
-        raise ValueError(
-            "nothing to change: pass level_db, dim, mute, mono, alt_speaker or "
-            "dim_attenuation_db."
-        )
-    writes, errors = await ctx.write_many(requests)
+        writes.extend(release_writes)
+        errors.extend(release_errors)
+
     return {
         "ok": not errors,
         "resolved": identity(monitor),
         "stored_level_db": stored,
+        "applied_level_db": applied_level,
+        "dim_on": dim_on,
         "ceiling_db": ctx.gate.max_monitor_db,
         "budget_remaining_db": ctx.gate.monitor_budget_remaining_db(),
         "writes": writes,
@@ -900,20 +1074,39 @@ async def tool_talkback(
     auto_off_s: float | None = None,
 ) -> dict[str, Any]:
     """Talkback on/off and level, with an auto-off timer so it cannot be left open."""
-    requests: list[tuple[str, Any, WriteContext | str]] = []
-    if level is not None:
-        requests.append(("/TalkbackMaster", level, WriteContext(reason="uad_talkback level")))
-    if on is not None:
-        requests.append(("/TalkbackOn", on, WriteContext(reason="uad_talkback on/off")))
-    if not requests:
+    if on is None and level is None:
         raise ValueError("nothing to change: pass on=true/false and/or level (0-100).")
-    writes, errors = await ctx.write_many(requests)
+    writes: list[dict[str, Any]] = []
+    errors: list[str] = []
+    if level is not None:
+        level_writes, level_errors = await ctx.write_many(
+            [(TALKBACK_MASTER_PATH, level, WriteContext(reason="uad_talkback level"))]
+        )
+        writes.extend(level_writes)
+        errors.extend(level_errors)
+    # The timer is armed on the TalkbackOn write's OWN outcome, and it is armed unless the gate
+    # REFUSED the write - the only case where talkback provably never opened. A level write that
+    # failed, or an ack that never came back, must not leave an open mic with no timer behind it;
+    # arming when talkback is in fact off costs one redundant write of False.
+    refused_by_policy = False
+    if on is not None:
+        try:
+            writes.append(
+                await ctx.write(
+                    TALKBACK_ON_PATH, on, context=WriteContext(reason="uad_talkback on/off")
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            refused_by_policy = isinstance(exc, SafetyRefusal)
+            errors.append(error_text(exc, client=ctx.client))
+
     timeout = ctx.talkback_auto_off_s if auto_off_s is None else max(0.0, float(auto_off_s))
     armed = False
-    if on is True and not errors:
-        if timeout > 0:
-            ctx.arm_talkback_auto_off(timeout)
-            armed = True
+    if on is True and not refused_by_policy and timeout > 0:
+        ctx.arm_talkback_auto_off(timeout)
+        armed = True
     elif on is False:
         ctx.cancel_talkback_auto_off()
     return {
@@ -934,7 +1127,9 @@ async def tool_safe_state(ctx: ServerContext) -> dict[str, Any]:
         (f"{monitor.path}/Mute", True, WriteContext(reason="uad_safe_state monitor mute"))
         for monitor in monitors
     ]
-    requests.append(("/TalkbackOn", False, WriteContext(reason="uad_safe_state talkback off")))
+    requests.append(
+        (TALKBACK_ON_PATH, False, WriteContext(reason="uad_safe_state talkback off"))
+    )
     ctx.cancel_talkback_auto_off()
     writes, errors = await ctx.write_many(requests)
     return {
@@ -976,21 +1171,49 @@ async def tool_set_clock(ctx: ServerContext, source: str, confirm: bool = False)
     if locked:
         result["ok"] = True
         return result
-    revert = await ctx.write(
-        "/ClockSource",
-        previous,
-        context=WriteContext(
-            reason="auto-revert: the new clock source never locked",
-            confirm=True,
-            audio_flowing=False,
-        ),
-    )
-    await asyncio.sleep(ctx.clock_verify_delay_s)
+    # The revert is best-effort: if IT fails, the populated result must still come back, saying
+    # plainly that the rig was left on an unlocked clock source.
+    try:
+        revert = await ctx.write(
+            "/ClockSource",
+            previous,
+            context=WriteContext(
+                reason="auto-revert: the new clock source never locked",
+                confirm=True,
+                audio_flowing=False,
+            ),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        result.update(
+            ok=False,
+            reverted=False,
+            revert_error=error_text(exc, client=ctx.client),
+            error=(
+                f"ClockLocked was still false {ctx.clock_verify_delay_s:g}s after switching to "
+                f"{write['after']!r}, AND the automatic revert to {previous!r} failed, so the "
+                f"clock source is left at {write['after']!r} and unlocked. Fix the engine "
+                f"connection, then set the clock back with "
+                f"uad_set_clock(source={previous!r}, confirm=true)."
+            ),
+        )
+        return result
+    # The revert itself landed. Re-reading ClockLocked is a separate, weaker claim: if that read
+    # fails we still reverted, so say "unknown" rather than mislabelling the revert as failed.
+    locked_after_revert: bool | None = None
+    try:
+        await asyncio.sleep(ctx.clock_verify_delay_s)
+        locked_after_revert = bool(await ctx.value("/ClockLocked"))
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("could not re-read ClockLocked after reverting: %s", exc)
     result.update(
         ok=False,
         reverted=True,
         revert=revert,
-        locked_after_revert=bool(await ctx.value("/ClockLocked")),
+        locked_after_revert=locked_after_revert,
         error=(
             f"ClockLocked was still false {ctx.clock_verify_delay_s:g}s after switching to "
             f"{write['after']!r}, so the clock source was reverted to {previous!r}. Check that "
@@ -1605,7 +1828,8 @@ async def tool_snapshot(
 
     if verb in ("save", "capture"):
         rig = await ctx.rig(refresh=True)
-        chosen = name or f"snapshot-{time.strftime('%Y%m%d-%H%M%S')}"
+        # UTC, to match the document's own `created` field and snapshot.py's pre-restore names.
+        chosen = name or f"snapshot-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}"
         doc = await snapshot.capture(ctx.client, rig, name=chosen)
         path = store.save(doc, chosen)
         return {
@@ -1697,6 +1921,67 @@ async def tool_raw_get(ctx: ServerContext, path: str) -> dict[str, Any]:
     }
 
 
+async def _raw_write_context(ctx: ServerContext, path: str, value: Any) -> WriteContext:
+    """The write context for ``uad_raw_set``, which knows nothing about the topology.
+
+    ``uad_raw_set`` can reach the monitor rail directly, so it reconstructs what the gate needs:
+
+    * ``Mute``/``DimOn`` under ``/outputs/``: look for the sibling ``CRMonitorLevel``. If that
+      property exists the strip IS a control-room monitor and the rail applies; if the read fails,
+      the gate refuses (fail closed). An output without it is an ordinary output.
+    * ``DimAttenuation``: find that device's monitor strip and read its level and ``DimOn``, so a
+      legitimate decrease is not blocked and a dangerous one still is.
+    """
+    reason = "uad_raw_set (full mode)"
+    name = property_name(path)
+    if name == DIM_ATTENUATION_PROPERTY:
+        return await _raw_dim_attenuation_context(ctx, path, reason)
+    if name not in MONITOR_RELEASE_PROPERTIES or not coerces_to_false(value):
+        return WriteContext(reason=reason, confirm=True)
+    if "/outputs/" not in path:
+        return WriteContext(reason=reason, confirm=True)
+    strip = path.rsplit("/", 1)[0]
+    try:
+        level = await ctx.client.get_prop(f"{strip}/{MONITOR_LEVEL_PROPERTY}")
+    except UAPathError:
+        # No CRMonitorLevel on this strip: it is an ordinary output, not the control room.
+        return WriteContext(reason=reason, confirm=True)
+    except UAError as exc:
+        logger.warning("could not read %s/%s: %s", strip, MONITOR_LEVEL_PROPERTY, exc)
+        return WriteContext(reason=reason, confirm=True, is_monitor=True)
+    return WriteContext(
+        reason=reason,
+        confirm=True,
+        is_monitor=True,
+        monitor_level_db=_number(level.value),
+    )
+
+
+async def _raw_dim_attenuation_context(
+    ctx: ServerContext, path: str, reason: str
+) -> WriteContext:
+    """Level + DimOn of the monitor strip on the device whose ``DimAttenuation`` is being set."""
+    device: int | None = None
+    parts = [part for part in path.split("/") if part]
+    if len(parts) >= 3 and parts[1].isdigit():
+        device = int(parts[1])
+    level: float | None = None
+    dim_on: bool | None = None
+    try:
+        monitor = (await ctx.rig()).monitor_output(device)
+    except UAError as exc:
+        logger.warning("no monitor output for %s: %s", path, exc)
+    else:
+        level, dim_on = await _monitor_rail_state(ctx, monitor.path)
+    return WriteContext(
+        reason=reason,
+        confirm=True,
+        is_monitor=True,
+        monitor_level_db=level,
+        dim_on=dim_on,
+    )
+
+
 @tool
 async def tool_raw_set(ctx: ServerContext, path: str, value: Any) -> dict[str, Any]:
     """Write any property directly. Registered only when UAD_MCP_MODE=full."""
@@ -1705,9 +1990,7 @@ async def tool_raw_set(ctx: ServerContext, path: str, value: Any) -> dict[str, A
             f"uad_raw_set is only available when UAD_MCP_MODE=full (current mode: "
             f"{ctx.gate.mode!r}). Use the specific tool for this property instead."
         )
-    write = await ctx.write(
-        path, value, context=WriteContext(reason="uad_raw_set (full mode)", confirm=True)
-    )
+    write = await ctx.write(path, value, context=await _raw_write_context(ctx, path, value))
     return {"writes": [write]}
 
 
@@ -1990,8 +2273,9 @@ def build_server(ctx: ServerContext) -> Any:
         name="uad_set_monitor",
         description=(
             "Set the control-room monitor: level_db (hard-railed), dim, mute, mono fold, alt "
-            "speaker selection, dim attenuation. Unmuting and un-dimming are treated as level "
-            "events and can be refused.\n"
+            "speaker selection, dim attenuation. Unmuting, un-dimming and LOWERING "
+            "dim_attenuation_db are all treated as level events and can be refused; level_db is "
+            "written first and the release is railed against the level the engine reports back.\n"
             "Use when: changing what the control room hears, or recovering after uad_safe_state.\n"
             "Not for: headphone level - the protocol cannot set it; see uad://limitations."
         ),

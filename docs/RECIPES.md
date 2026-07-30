@@ -48,8 +48,17 @@ one step that waits for you.
 8. **The singer's headphones.** `uad_set_sends` with `send: "cue1"` and `level_db` around -6, plus
    some of the backing track. The headphone output *level* cannot be set from here at all, so the
    cue balance is made entirely with send levels and the final trim is the physical knob.
-9. **Control room.** `uad_set_monitor(level_db=...)`. The ceiling is enforced. If a request is
-   refused, the right response is to tell you the stored level and the ceiling, not to retry.
+   Read the sends first, because no tool reads them for you: `uad_raw_get(path=".../inputs/0/sends")`
+   lists one node per send, and each node carries `ID` (`aux1`, `aux2`, `cue1` to `cue4`) plus
+   `Gain`, `Pan` and `Bypass`. `Gain` runs -144 to +12 dB, and **-144.0 means that send is off**, so
+   a `before: -144.0` in the write result is the normal starting point, not a failure. All four
+   `cueN` nodes exist even on a two-cue Apollo: a write to `cue3` there verifies but comes back with
+   a warning that it reaches no real output, and that warning is the answer, not a footnote.
+9. **Control room.** `uad_set_monitor(level_db=...)`. The ceiling is enforced, and a request above it
+   is refused outright rather than part-applied, so the right response is to tell you the stored
+   level and the ceiling, not to retry. To read the current level, use
+   `uad_list_channels(kind="output")` and take `monitor_level_db` from the strip with
+   `is_monitor: true`: `uad_get_status` does not report it.
 10. **Save it.** `uad_snapshot(action="save", name="vocal-tracking")`, so tomorrow's session starts
     from today's setup.
 
@@ -80,7 +89,10 @@ Adding an ADA8200, a second interface in ADAT mode, or any 8-channel optical exp
    4. Channels 5 to 8 going dead at high rates is expected behaviour, not a fault.
 5. **Name the strips.** `uad_list_channels(kind="input")` and find the ones with `io_type: "ADAT"`.
    With `uad_set_channels`, rename each to what is physically patched into the expander, set
-   `hidden: false`, `enabled: true`, `fader_db: 0`, `mute: false`.
+   `hidden: false`, `enabled: true`, `fader_db: 0`, `mute: false`. The `active` flag in that listing
+   is a different thing: it is read-only engine state, and `active: false` is normal on the right leg
+   of a stereo pair, on unused strips and on some outputs. It is not a fault and not writable.
+   `enabled` (`EnabledByUser`) is the one you set.
 6. **Verify with signal, not with hope.** Send something through the expander, then
    `uad_peek_meters(targets=[...the ADAT channels...])`. If every ADAT meter sits at exactly the
    floor (-77 dB), that is the signature of no clock lock or a dead optical cable, **not** silence.
@@ -95,7 +107,9 @@ Adding an ADA8200, a second interface in ADAT mode, or any 8-channel optical exp
 For no signal on ADAT or S/PDIF inputs, a clock that will not lock, or garbled digital audio. Read
 each step's numbers before acting on them.
 
-1. `uad_get_status`. Note `clock.source`, `clock.locked`, `clock.sample_rate`.
+1. `uad_get_status`. Note `engine.audio_streaming` first: if it is false the engine is passing no
+   audio at all, no meter anywhere will move, and nothing below will tell you anything useful.
+   Then note `clock.source`, `clock.locked`, `clock.sample_rate`.
 2. **If `clock.locked` is false**, the Apollo is chasing a clock it cannot see: the external device
    is off, unplugged, or at a different rate, or `ClockSource` points at an input with no clock on
    it. To get back to known-good, stop all audio and call
@@ -111,9 +125,17 @@ each step's numbers before acting on them.
    `ADAT`, `Word Clock` or `S/PDIF` to match, and the external rate must equal the Apollo's.
 5. **Sample rate mismatch is the single most common cause.** 44.1 against 48 kHz shows up as no lock
    or as garbled, wrong-pitch audio. Compare the device's front panel to `clock.sample_rate`.
-6. **Cabling.** Swap the optical cable. Confirm OUT goes to IN in both directions, and that you are
+6. **S/PDIF is a special case: there is no return-cable trick.** One S/PDIF link, coax or optical,
+   carries clock in one direction only, so you cannot slave the source the way a second ADAT cable
+   slaves an expander. Three ways out, in order of preference: let the source clock the Apollo with
+   `uad_set_clock(source="S/PDIF", confirm=true)` and matched sample rates; slave the source to the
+   Apollo if it has a sync input of its own; or turn on sample-rate conversion for that input
+   (`SRConvert` on the S/PDIF strip, readable with `uad_raw_get`, writable only in `full` mode with
+   `uad_raw_set` or in Console). Meters at the floor with `ClockSource: Internal` and
+   `SRConvert: false` is the classic signature of exactly this.
+7. **Cabling.** Swap the optical cable. Confirm OUT goes to IN in both directions, and that you are
    not looking at an S/PDIF optical port. TOSLINK failures are silent.
-7. **After every change**, `uad_get_status` again for `clock.locked`, then `uad_peek_meters` to
+8. **After every change**, `uad_get_status` again for `clock.locked`, then `uad_peek_meters` to
    confirm signal is actually arriving.
 
 Why the confirmations exist: `uad_set_clock` and `uad_set_sample_rate` both refuse while audio is
@@ -136,7 +158,10 @@ Something is wrong right now. Get safe first, diagnose second.
 5. **Only then** bring the monitors back: `uad_set_monitor(mute=false)`. If that is refused, the
    stored monitor level is above the safety ceiling: lower it first with
    `uad_set_monitor(level_db=...)`, then release the mute. Come up in steps. The rail allows at most
-   +6 dB per call and +10 dB per 30 seconds.
+   +6 dB per call and +10 dB per 30 seconds, and anything **above** the ceiling is refused outright
+   rather than trimmed to fit, so ask for a number at or below it. Because of that budget, climbing
+   back out of a very low level through the server is deliberately slow: for a big jump, use the
+   physical monitor knob instead of waiting the window out.
 6. If the state is scrambled beyond quick repair, `uad_snapshot(action="list")`, then
    `uad_snapshot(action="restore", name=..., dry_run=true)` to see the exact ordered write list
    before running it with `dry_run=false`. A real restore captures a `pre-restore-*` snapshot first,
@@ -179,7 +204,7 @@ Anything averaging near 0 dBFS is too hot no matter how it sounds. Anything aver
 | Reading | Meaning |
 |---|---|
 | `-77.0` (or -76.99999) | Device-silence floor. Silence **or** a dead digital link, indistinguishable |
-| `-144.0` | Absolute floor |
+| `-144.0` | Absolute floor. On a send's `Gain` (range -144 to +12 dB) the same number means that send is off |
 | around -18 | Healthy average for a performance |
 | above -6 | Too hot, back the gain off |
 | `clip: true` | The converter clipped. Fix the gain and redo the take |

@@ -29,6 +29,30 @@ uad_get_status()
 index. If the ID is wrong, `uad_set_sends` returns an error listing the available IDs for that
 channel, which is the fastest way to discover the real set.
 
+**All four `cueN` nodes exist in the tree even when `cue_buses` is 2.** A write to `cue3` on a
+two-cue Apollo therefore comes back `verified: true` and reaches no real output. `uad_set_sends`
+attaches a warning saying exactly that; relay it and rebuild the mix on `cue1` or `cue2` rather than
+reporting a success.
+
+## Read a send before you write it
+
+There is no send-read tool, so read the nodes directly:
+
+```
+uad_raw_get(path="/devices/0/inputs/0/sends")
+-> {kind: "node", children: ["0","1","2","3","4","5"]}     one node per send
+
+uad_raw_get(path="/devices/0/inputs/0/sends/2")
+-> {properties: {ID: {value: "cue1"}, Gain: {value: -144.0, min: -144.0, max: 12.0},
+                 Pan: {value: 0.0}, Bypass: {value: false}}}
+```
+
+The node's `ID` is what `uad_set_sends` calls `send`. `Gain` is the send level in dB, range **-144 to
++12**, and **-144.0 means the send is off**, which is the default on an untouched strip. So a result
+reading `"before": -144.0, "after": -6.0` is a send being switched on, not a value that failed to
+read. Read before you write whenever you are adjusting an existing mix by ear: without the current
+number, "a bit more of yourself" is a guess.
+
 ## One performer
 
 Everything they need to hear, in one call. The performer's own signal loudest, everything else

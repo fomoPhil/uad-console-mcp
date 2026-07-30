@@ -44,7 +44,7 @@ because of one measured fact about the engine:
 | `UAD_MCP_MODE` | What it allows |
 |---|---|
 | `readonly` | Nothing is written, ever. Every write is refused before it reaches the socket. Good for a first look, and for letting an LLM inspect a live session during a take |
-| `safe` (**default**) | Writes allowed only to an allowlist of 34 property names: names, faders, pans, mutes, solos, preamp controls, sends, plugin slots and parameters, monitor, talkback, clock and rate. Everything else is refused |
+| `safe` (**default**) | Writes allowed only to an allowlist of 35 property names: names, faders, pans, mutes, solos, preamp controls, sends, plugin slots and parameters, monitor, talkback, clock, rate, and per-input sample-rate conversion (`SRConvert`). Everything else is refused |
 | `full` | The allowlist is bypassed and `uad_raw_set` is registered. The monitor rail, the permanent denylist, and the write rate limit still apply |
 
 In every mode a permanent denylist refuses device identity and engine internals (`DeviceHwID`,
@@ -61,13 +61,22 @@ loud as setting 0 dB.
 |---|---|---|
 | `UAD_MCP_MODE` | `safe` | `readonly`, `safe`, or `full` (above) |
 | `UAD_MCP_MAX_MONITOR_DB` | `-6.0` | Hard ceiling on monitor level in dB. Requests above it are refused, not silently clamped. Unmuting onto an above-ceiling stored level is refused too |
-| `UAD_MCP_MAX_MONITOR_STEP_DB` | `6.0` | Largest increase allowed in one call. Bigger jumps are clamped down to this |
+| `UAD_MCP_MAX_MONITOR_STEP_DB` | `6.0` | Largest increase allowed in one call, for requests at or below the ceiling. Bigger jumps are clamped down to this |
 | `UAD_MCP_MONITOR_WINDOW_DB` | `10.0` | Total increase allowed inside the rolling window |
 | `UAD_MCP_MONITOR_WINDOW_SECONDS` | `30.0` | Length of that rolling window, in seconds |
 | `UAD_MCP_WRITES_PER_SECOND` | `10.0` | Global write rate limit (token bucket), so a confused agent cannot machine-gun the engine |
 | `UAD_MCP_WRITE_BURST` | `20` | Burst size for that rate limit |
 | `UAD_MCP_ALLOW_READONLY_WRITES` | `0` | Off by default: writes to properties the engine marks read-only are refused. Only set this if you know exactly which property you mean |
 | `UAD_MCP_SNAPSHOT_DIR` | `~/.uad-console-mcp/snapshots` | Where `uad_snapshot` files are written |
+
+The ceiling and the step limit are not the same rail, and the order matters. **The ceiling is
+checked first: a request above it is refused outright and nothing is written**, not even a partial
++6 dB move. The per-call step clamp only applies to requests that are already at or below the
+ceiling, where a too-large jump is trimmed to +6 dB and applied.
+
+One consequence worth saying out loud: **climbing back out of a very low monitor level through this
+server is deliberately slow** (+6 dB per call, +10 dB per 30 s). For a big jump, use the physical
+monitor knob instead of waiting out the budget.
 
 Every refusal names the variable or confirm flag that would unblock it, so an agent can tell you
 the remedy instead of retrying blindly:
@@ -237,11 +246,11 @@ returns an actionable sentence instead of a traceback when something fails.
 
 | Tool | One line |
 |---|---|
-| `uad_get_status` | Engine, clock, sample rate, DSP load, every Apollo in the cascade, and the effective safety limits |
-| `uad_list_channels` | Every input, aux or output strip across every unit, grouped by device, with live fader, mute, solo, pan, hidden and stereo state |
+| `uad_get_status` | Engine (including `engine.audio_streaming`), clock, sample rate, DSP load, every Apollo in the cascade with its `cue_buses` count, and the effective safety limits. It does **not** carry the monitor level |
+| `uad_list_channels` | Every input, aux or output strip across every unit, grouped by device, with live fader, mute, solo, solo_safe, pan, hidden and stereo state, plus `io_type`, `has_preamp`, `is_monitor`, `is_talkback`, `active`, `path`, and `monitor_level_db` on the monitor output |
 | `uad_set_channels` | Batch: `fader_db`, `pan`, `pan2`, `mute`, `solo`, `solo_safe`, `name`, `hidden`, `stereo`, `enabled` per item, targeted by name or index |
 | `uad_set_preamp` | One mic/line input's `gain_db`, `pad`, `low_cut`, `phase`, `hi_z`, `source`, and 48V (which needs `confirm_condenser_mic=true`) |
-| `uad_set_sends` | Batch: a channel's `level_db`, `pan` or `bypass` into an aux or cue bus (`send: "aux1"`, `"cue1"`, or an index) |
+| `uad_set_sends` | Batch: a channel's `level_db`, `pan` or `bypass` into an aux or cue bus (`send: "aux1"`, `"cue1"`, or an index). `level_db` runs -144 to +12 dB, where -144.0 means the send is off. A write to a `cueN` above the device's `cue_buses` count verifies but comes back with a phantom-bus warning |
 | `uad_set_monitor` | Control room: `level_db` (railed), `dim`, `mute`, `mono`, `alt_speaker`, `dim_attenuation_db` |
 | `uad_talkback` | Talkback on/off and level, with an auto-off timer (default 30 s) so an open talkback mic cannot be forgotten |
 | `uad_safe_state` | Panic button, no arguments: mute every monitor output and turn talkback off |
@@ -257,8 +266,51 @@ returns an actionable sentence instead of a traceback when something fails.
 | `uad_peek_meters` | One-shot meter read (level, peak, clip) with at-floor channels called out |
 | `uad_watch_meters` | Poll meters for up to `duration_s` (capped at 30 s) and return the moment any channel crosses `threshold_db` |
 | `uad_snapshot` | `action="save" / "list" / "diff" / "restore"` for whole-rig state. Restore is `dry_run=true` by default and captures a `pre-restore-*` snapshot first |
-| `uad_raw_get` | Read any node or property in the engine tree verbatim, with its metadata. Read-only escape hatch |
-| `uad_raw_set` | **`full` mode only.** Write any property, bypassing the allowlist. The monitor rail, denylist and rate limit still apply |
+| `uad_raw_get` | Read any node or property in the engine tree verbatim, with its metadata. One argument, `path` (`uad_raw_get(path="/ClockSource")`). Read-only escape hatch |
+| `uad_raw_set` | **`full` mode only.** Write any property by `path` and `value`, bypassing the allowlist. The monitor rail, denylist and rate limit still apply |
+
+### Reading state that no tool returns directly
+
+Four things are readable but easy to miss, because the obvious tool does not return them.
+
+**A send's current level.** There is no send-read tool. Read the send nodes with `uad_raw_get`
+before you write, so you know what you are changing:
+
+```
+uad_raw_get(path="/devices/0/inputs/0/sends")
+-> {kind: "node", children: ["0","1","2","3","4","5"]}     one node per send
+
+uad_raw_get(path="/devices/0/inputs/0/sends/2")
+-> {properties: {ID: {value: "cue1"}, Gain: {value: -144.0, min: -144.0, max: 12.0},
+                 Pan: {value: 0.0}, Bypass: {value: false}}}
+```
+
+The node's `ID` is what `uad_set_sends` calls `send`: `aux1`, `aux2`, `cue1` through `cue4`. `Gain`
+is the level in dB, from -144 to +12, and **-144.0 means the send is off**, which is the default on
+a fresh strip. All four `cueN` nodes exist in the tree even on a device that reports `cue_buses: 2`,
+so a write to `cue3` there verifies happily while reaching no real output: `uad_set_sends` adds a
+warning saying exactly that, and an agent should relay it rather than reporting success.
+
+**The monitor level.** `uad_get_status` does not carry it. Read it from
+`uad_list_channels(kind="output")`: the strip with `is_monitor: true` has `monitor_level_db`
+(the engine's `CRMonitorLevel`). Write it with `uad_set_monitor(level_db=...)`, through the rails.
+
+**`active` is not a fault light.** Every strip reports a read-only `active` flag, which is engine
+state, not user state. `active: false` is **normal** on the right leg of every stereo pair, on
+unused strips, and on some outputs: on the captured x8 Gen 2 tree, `S/PDIF R` and the working
+`MONITOR` output both report `active: false`. It is not writable and there is nothing to fix. The
+writable switch is `enabled` (`EnabledByUser`), set with
+`uad_set_channels(items=[{"target": N, "enabled": true}])`.
+
+**`SRConvert`, per-input sample-rate conversion.** Each digital input strip (S/PDIF on the x8 Gen 2)
+carries a boolean `SRConvert`, which lets that input arrive at a different sample rate from the
+Apollo's. Read it with `uad_raw_get(path="/devices/0/inputs/16/SRConvert")`. **No dedicated tool
+writes it:** it is on the safe-mode allowlist, which is what lets `uad_snapshot` capture and restore
+it, but changing it live needs `uad_raw_set` in `full` mode, or Console.
+
+**And for any "no sound" question, check `engine.audio_streaming` in `uad_get_status` first.** If it
+is false, the engine is passing no audio at all and no meter anywhere will move, so hunting through
+channels, sends and the monitor path is wasted effort.
 
 ### Resources
 
@@ -289,7 +341,8 @@ resource says the same thing to the model at runtime.
 | **Creating or deleting channels** | The strip list is fixed by the hardware model |
 | **Audio itself** | No capture, no playback, no analysis. Meters are polled at about 3 Hz, `uad_watch_meters` caps at 30 s, and a meter at the floor (-77 dB) cannot tell a silent source from a dead digital link |
 | **Per-plugin DSP cost** | Only the totals are exposed (`TotalDSPLoad`, `TotalPGMLoad`, `TotalMEMLoad`), in `uad_get_status` |
-| **Monitor level above the ceiling** | By design: `UAD_MCP_MAX_MONITOR_DB` (default -6 dB), at most +6 dB per call and +10 dB per 30 s. Raise the variable deliberately, or turn the knob yourself |
+| **Monitor level above the ceiling** | By design: `UAD_MCP_MAX_MONITOR_DB` (default -6 dB), at most +6 dB per call and +10 dB per 30 s. A request above the ceiling is refused outright rather than clamped down to it. Raise the variable deliberately, or turn the knob yourself |
+| **Writing `SRConvert` in `safe` mode** | The property is allowlisted so snapshots can restore it, but no tool exposes it. Read it with `uad_raw_get`; to change it, use `uad_raw_set` in `full` mode or set it in Console |
 
 ## Companion skills
 

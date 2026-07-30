@@ -56,6 +56,22 @@ uad_set_clock(source="Internal", confirm=true)   # Apollo is master
 waits about 2.5 s, checks `ClockLocked`, and reverts itself if the new source does not lock. A
 revert is a real answer: it means the clock the user pointed at is not present.
 
+## S/PDIF: no return-cable option
+
+The "Apollo is master" row above does not exist for S/PDIF. One S/PDIF link, coax or optical, carries
+clock in one direction only, so there is no second cable that would slave the source. Three ways to
+make an S/PDIF source work, in order of preference:
+
+1. **Source clocks the Apollo:** `uad_set_clock(source="S/PDIF", confirm=true)`, both boxes at the
+   same sample rate.
+2. **Slave the source to the Apollo** if it has a word clock or sync input of its own.
+3. **Sample-rate conversion on that input.** Each S/PDIF strip carries a boolean `SRConvert`,
+   readable with `uad_raw_get(path="/devices/0/inputs/16/SRConvert")`. No tool writes it: that needs
+   `uad_raw_set` in `full` mode, or Console.
+
+Meters at the floor with `ClockSource: Internal` and `SRConvert: false` is the classic S/PDIF
+signature: the Apollo is master, the source runs on its own clock, and nothing converts between them.
+
 ## Sample rate and ADAT channel counts
 
 | Sample rate | Channels per ADAT optical port | Mechanism |

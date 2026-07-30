@@ -5,6 +5,16 @@ and change one thing at a time.
 
 ## Tree 1: "no sound from channel X"
 
+**Step 0. Is the engine passing audio at all?**
+
+```
+uad_get_status()
+```
+
+`engine.audio_streaming: false` means no audio is running through the engine, so **no meter anywhere
+will move** and every step below is wasted effort. Check it first in any no-sound triage: usually
+nothing has the device open, or the driver is asleep after a sleep or a cable event.
+
 **Step 1. Is signal arriving at all?**
 
 ```
@@ -69,6 +79,21 @@ Read `clock.source`, `clock.locked`, `clock.sample_rate`, then work the table:
 | `locked: true`, `source: ADAT`, still nothing | the expander is meant to be master but is not sending clock | expander powered and on internal clock, cable in the right port, rate matching |
 | rates differ between boxes | most common cause of all | match them exactly. `uad_set_sample_rate(rate=48000, confirm=true)` |
 
+**S/PDIF has no return-cable trick.** The ADAT fix above (add a second optical cable so the Apollo
+clocks the expander) has no S/PDIF equivalent: one S/PDIF link, coax or optical, carries clock in one
+direction only. Three ways out, in order of preference:
+
+1. **Let the source clock the Apollo:** `uad_set_clock(source="S/PDIF", confirm=true)`, with both
+   boxes at the same sample rate. Refuses while audio is flowing, and reverts if it does not lock.
+2. **Slave the source to the Apollo** if it has a word clock or sync input of its own.
+3. **Turn on sample-rate conversion for that input.** Each S/PDIF strip carries a boolean
+   `SRConvert`. Read it with `uad_raw_get(path="/devices/0/inputs/16/SRConvert")`. No tool writes it:
+   it needs `uad_raw_set` in `full` mode, or Console.
+
+**Meters at the floor with `ClockSource: Internal` and `SRConvert: false` is the classic S/PDIF
+signature.** The Apollo is master, the source is running on its own clock, nothing is converting
+between them, and the input reads as digitally silent.
+
 Key facts to state to the user:
 
 - **Exactly one device may be the clock master.** Two masters: nothing locks, audio drifts or clicks.
@@ -121,7 +146,8 @@ uad_list_channels(kind="input", include_hidden=true)
 | Finding | Cause | Fix |
 |---|---|---|
 | Channel present with `hidden: true` | `ChannelHidden` | `uad_set_channels(items=[{"target": N, "hidden": false}])` |
-| Present but `active: false` or `enabled` off | `EnabledByUser` | `uad_set_channels(items=[{"target": N, "enabled": true}])` |
+| Present but `enabled` off (`EnabledByUser`) | the user switched the strip off | `uad_set_channels(items=[{"target": N, "enabled": true}])` |
+| Present with `active: false` | **not a fault.** `active` is read-only engine state, and `false` is normal on the right leg of every stereo pair, on unused strips and on some outputs | nothing. It is not writable, and it is not why a channel looks missing. Check `hidden` and `enabled` instead |
 | Not in the list at all, ADAT channels 5 to 8 | S/MUX at a high sample rate | at 88.2/96 kHz an ADAT port carries 4 channels, at 176.4/192 kHz only 2. Expected. Drop to 48 kHz to get all 8 back |
 | A whole unit's channels gone | that Apollo is offline | check `devices[].online` in `uad_get_status`, then power and Thunderbolt |
 | Channel exists but Console shows something different | Console and the engine are both clients of the same engine, so they agree. A stale view usually means the rate changed under it | `uad_get_status` is the authority. Re-read it |

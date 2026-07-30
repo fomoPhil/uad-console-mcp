@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import random
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -25,13 +27,16 @@ from tests.mock_engine import MockEngine
 from uad_console_mcp import __main__ as cli
 from uad_console_mcp import server as srv
 from uad_console_mcp import snapshot as snap
-from uad_console_mcp.client import UAClient, UAConnectError
+from uad_console_mcp.client import UAClient, UAConnectError, UATimeoutError
 from uad_console_mcp.safety import SafetyGate
 
 Tree = dict[str, Any]
 
 MONITOR = "/devices/0/outputs/22"
 MONITOR_LEVEL = f"{MONITOR}/CRMonitorLevel"
+MONITOR_MUTE = f"{MONITOR}/Mute"
+MONITOR_DIM = f"{MONITOR}/DimOn"
+DIM_ATTENUATION = "/devices/0/DimAttenuation"
 IN0 = "/devices/0/inputs/0"
 IN0_METER = f"{IN0}/meters/0/MeterLevel"
 IN18_SLOT1 = "/devices/0/inputs/18/effects/1"
@@ -87,6 +92,17 @@ async def wait_until(predicate: Any, limit: float = 5.0, step: float = 0.02) -> 
     return predicate()
 
 
+def monitor_exposure(engine: MockEngine) -> float | None:
+    """The level the control room is actually exposed to, or None while it is muted."""
+    if engine.value(MONITOR_MUTE):
+        return None
+    level = engine.value(MONITOR_LEVEL)
+    assert isinstance(level, int | float)
+    dimmed = bool(engine.value(MONITOR_DIM))
+    attenuation = engine.value(DIM_ATTENUATION) if dimmed else 0.0
+    return float(level) - float(attenuation or 0.0)
+
+
 def channel_named(payload: dict[str, Any], name: str) -> dict[str, Any]:
     for device in payload["devices"]:
         for channel in device["channels"]:
@@ -127,8 +143,19 @@ async def test_get_status_golden_shape(mock: MockEngine) -> None:
         "memory_load_percent",
     }
     assert 0 <= result["dsp"]["total_dsp_load_percent"] <= 100
-    assert set(result["talkback"]) == {"on", "level", "auto_off_timer_running"}
-    assert result["talkback"] == {"on": False, "level": 0, "auto_off_timer_running": False}
+    assert set(result["talkback"]) == {
+        "on",
+        "level",
+        "auto_off_timer_running",
+        "auto_off_failed",
+    }
+    assert result["talkback"]["auto_off_failed"] is False
+    assert result["talkback"] == {
+        "on": False,
+        "level": 0,
+        "auto_off_timer_running": False,
+        "auto_off_failed": False,
+    }
     assert len(result["devices"]) == 1
     assert set(result["devices"][0]) == {
         "device",
@@ -194,6 +221,18 @@ async def test_list_channels_covers_every_kind_and_the_monitor(mock: MockEngine)
     assert monitor["kind"] == "output"
     aux = channel_named(result, "AUX 1")
     assert aux["kind"] == "aux"
+
+
+async def test_list_channels_only_polls_the_monitor_for_its_level(mock: MockEngine) -> None:
+    """m9: 55 of 56 strips have no CRMonitorLevel; asking them for it is pure wire noise."""
+    async with context(mock) as ctx:
+        await ctx.rig()
+        before = len(mock.sent_frames)
+        result = await srv.tool_list_channels(ctx, kind="all")
+    asked = [frame for frame in mock.sent_frames[before:] if "CRMonitorLevel" in frame]
+    assert asked == [f"get {MONITOR_LEVEL}"]
+    assert channel_named(result, "MONITOR")["monitor_level_db"] == -22.0
+    assert "monitor_level_db" not in channel_named(result, "ANALOG 1")
 
 
 async def test_list_channels_can_hide_hidden_strips(mock: MockEngine) -> None:
@@ -392,7 +431,9 @@ async def test_set_monitor_clamps_the_per_call_step(mock: MockEngine) -> None:
 async def test_no_sequence_of_monitor_calls_can_pass_the_ceiling(mock: MockEngine) -> None:
     """SPEC §4.7 monitor rail property: the engine value never exceeds the ceiling."""
     now = [0.0]
-    gate = SafetyGate("safe", clock=lambda: now[0])
+    # A generous token bucket: refusals cost tokens too, and a rate-limited call proves nothing
+    # about the monitor rail.
+    gate = SafetyGate("safe", writes_per_second=500.0, write_burst=500, clock=lambda: now[0])
     ceiling = gate.max_monitor_db
     rng = random.Random(20260729)
     async with context(mock, gate=gate) as ctx:
@@ -405,10 +446,244 @@ async def test_no_sequence_of_monitor_calls_can_pass_the_ceiling(mock: MockEngin
                 await srv.tool_set_monitor(ctx, mute=False)
             if step % 5 == 0:
                 await srv.tool_set_monitor(ctx, dim=False)
+            if step % 4 == 0:
+                await srv.tool_set_monitor(ctx, dim=True, dim_attenuation_db=rng.randint(0, 40))
+            if step % 7 == 0:
+                await srv.tool_set_monitor(ctx, dim_attenuation_db=rng.randint(0, 60))
             now[0] += rng.choice([0.0, 1.0, 31.0])
             level = mock.value(MONITOR_LEVEL)
             assert level is not None
             assert level <= ceiling + 1e-9, f"step {step}: {level} exceeded the {ceiling} ceiling"
+
+
+async def test_the_server_never_newly_exposes_an_above_ceiling_level(mock: MockEngine) -> None:
+    """The real property: no call may RAISE what the room hears past the ceiling.
+
+    The physical monitor knob is modelled with engine-side pushes, so the stored level goes hot
+    without the server's help. Every release path (unmute, un-dim, and lowering the dim
+    attenuation) must then refuse rather than open that level up.
+    """
+    now = [0.0]
+    gate = SafetyGate("safe", writes_per_second=500.0, write_burst=500, clock=lambda: now[0])
+    ceiling = gate.max_monitor_db
+    rng = random.Random(4710)
+    calls: list[Any] = [
+        lambda ctx: srv.tool_set_monitor(ctx, mute=False),
+        lambda ctx: srv.tool_set_monitor(ctx, mute=True),
+        lambda ctx: srv.tool_set_monitor(ctx, dim=False),
+        lambda ctx: srv.tool_set_monitor(ctx, dim=True),
+        lambda ctx: srv.tool_set_monitor(ctx, dim_attenuation_db=rng.randint(0, 17)),
+        lambda ctx: srv.tool_set_monitor(ctx, dim_attenuation_db=rng.randint(18, 60)),
+        lambda ctx: srv.tool_set_monitor(ctx, level_db=rng.uniform(-60.0, 6.0)),
+        lambda ctx: srv.tool_set_monitor(ctx, level_db=rng.uniform(-60.0, 6.0), mute=False),
+        lambda ctx: srv.tool_set_channels(
+            ctx, [{"target": "MONITOR", "kind": "output", "mute": False}]
+        ),
+        lambda ctx: srv.tool_safe_state(ctx),
+    ]
+    async with context(mock, gate=gate) as ctx:
+        for step in range(60):
+            if step % 5 == 0:
+                # The physical panel: knob turned up past the ceiling, dim engaged to tame it.
+                # Every release path is now one write away from an above-ceiling room.
+                await mock.push(MONITOR_LEVEL, rng.uniform(-4.0, 0.0))
+                await mock.push(MONITOR_MUTE, False)
+                await mock.push(MONITOR_DIM, True)
+                await mock.push(DIM_ATTENUATION, 17)
+            before = monitor_exposure(mock)
+            result = await rng.choice(calls)(ctx)
+            assert isinstance(result, dict)
+            after = monitor_exposure(mock)
+            now[0] += rng.choice([0.0, 1.0, 31.0])
+            if after is None:
+                continue
+            if before is None or after > before + 1e-9:
+                assert after <= ceiling + 1e-9, (
+                    f"step {step}: exposure rose from {before} to {after}, past {ceiling}: "
+                    f"{result}"
+                )
+
+
+async def test_lowering_the_dim_attenuation_cannot_un_dim_past_the_ceiling(
+    mock: MockEngine,
+) -> None:
+    """B2 repro: 0 dB stored, dimmed 17 dB, then ask for 0 dB of dim. That is a +17 dB jump."""
+    async with context(mock) as ctx:
+        await mock.push(MONITOR_LEVEL, 0.0)
+        await mock.push(MONITOR_DIM, True)
+        result = await srv.tool_set_monitor(ctx, dim_attenuation_db=0)
+    assert result["ok"] is False
+    assert "UAD_MCP_MAX_MONITOR_DB" in result["errors"][0]
+    assert "un-dim" in result["errors"][0]
+    assert mock.value(DIM_ATTENUATION) == 17, "nothing may reach the wire when refused"
+
+
+async def test_lowering_the_dim_attenuation_is_allowed_when_the_room_stays_quiet(
+    mock: MockEngine,
+) -> None:
+    async with context(mock) as ctx:
+        await mock.push(MONITOR_DIM, True)
+        result = await srv.tool_set_monitor(ctx, dim_attenuation_db=0)
+    assert result["ok"] is True, result
+    assert mock.value(DIM_ATTENUATION) == 0, "-22 dB with no dim is still under the ceiling"
+
+
+async def test_raising_the_dim_attenuation_is_always_allowed(mock: MockEngine) -> None:
+    async with context(mock) as ctx:
+        await mock.push(MONITOR_LEVEL, 0.0)
+        await mock.push(MONITOR_DIM, True)
+        result = await srv.tool_set_monitor(ctx, dim_attenuation_db=40)
+    assert result["ok"] is True, result
+    assert mock.value(DIM_ATTENUATION) == 40
+
+
+async def test_dim_attenuation_fails_closed_when_the_level_read_fails(
+    mock: MockEngine,
+) -> None:
+    async with context(mock) as ctx:
+        await mock.push(MONITOR_DIM, True)
+        await mock.push(MONITOR_LEVEL, None)  # the engine answered with no usable value
+        result = await srv.tool_set_monitor(ctx, dim_attenuation_db=0)
+    assert result["ok"] is False
+    assert "CRMonitorLevel" in result["errors"][0]
+    assert mock.value(DIM_ATTENUATION) == 17
+
+
+async def test_set_monitor_rails_the_release_against_the_verified_level(
+    mock: MockEngine,
+) -> None:
+    """M4: the release is checked against what the engine confirmed, not what was asked for."""
+    async with context(mock) as ctx:
+        await mock.push(MONITOR_LEVEL, -30.0)
+        await mock.push(MONITOR_MUTE, True)
+        result = await srv.tool_set_monitor(ctx, level_db=-8.0, mute=False)
+    assert result["ok"] is True, result
+    assert result["applied_level_db"] == -24.0, "+6 dB per call, not the -8 dB requested"
+    assert mock.value(MONITOR_LEVEL) == -24.0
+    assert mock.value(MONITOR_MUTE) is False
+
+
+async def test_set_monitor_rails_the_release_on_what_the_engine_reports(
+    mock: MockEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M4, the dangerous direction: the engine says it applied a level far above the ceiling.
+
+    The request was quiet, so railing on the REQUESTED value would happily unmute into it.
+    """
+    async with context(mock) as ctx:
+        await mock.push(MONITOR_MUTE, True)
+        real_set = ctx.client.set_value
+
+        async def lying_set(path: str, value: Any) -> Any:
+            applied = await real_set(path, value)
+            return -1.0 if path == MONITOR_LEVEL else applied
+
+        monkeypatch.setattr(ctx.client, "set_value", lying_set)
+        result = await srv.tool_set_monitor(ctx, level_db=-40.0, mute=False)
+
+    assert result["ok"] is False
+    assert result["applied_level_db"] == -1.0, "the reported level is what the rail must see"
+    assert "UAD_MCP_MAX_MONITOR_DB" in " ".join(result["errors"])
+    assert mock.value(MONITOR_MUTE) is True, "the mute must stay engaged"
+
+
+async def test_set_monitor_still_releases_when_the_engine_quantizes_the_level(
+    mock: MockEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M4 must not block a SAFE unmute over float noise: engines quantize (SPEC §1)."""
+    async with context(mock) as ctx:
+        await mock.push(MONITOR_MUTE, True)
+        real_set = ctx.client.set_value
+
+        async def quantizing_set(path: str, value: Any) -> Any:
+            applied = await real_set(path, value)
+            return -34.996 if path == MONITOR_LEVEL else applied
+
+        monkeypatch.setattr(ctx.client, "set_value", quantizing_set)
+        result = await srv.tool_set_monitor(ctx, level_db=-35.0, mute=False)
+
+    assert result["applied_level_db"] == -34.996
+    assert mock.value(MONITOR_MUTE) is False, "a level 29 dB under the ceiling must still unmute"
+    assert any("-34.996" in warning for write in result["writes"] for warning in write["warnings"])
+
+
+async def test_set_monitor_skips_the_release_when_the_level_is_unreadable(
+    mock: MockEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M4: no usable number back from the engine means no railing is possible. Skip the release."""
+    async with context(mock) as ctx:
+        await mock.push(MONITOR_MUTE, True)
+        real_set = ctx.client.set_value
+
+        async def mute_set(path: str, value: Any) -> Any:
+            applied = await real_set(path, value)
+            return None if path == MONITOR_LEVEL else applied
+
+        monkeypatch.setattr(ctx.client, "set_value", mute_set)
+        result = await srv.tool_set_monitor(ctx, level_db=-40.0, mute=False)
+
+    assert result["ok"] is False
+    assert result["applied_level_db"] is None
+    assert any("Skipped releasing Mute" in error for error in result["errors"])
+    assert any("no usable monitor level" in error for error in result["errors"])
+    assert mock.value(MONITOR_MUTE) is True, "the mute must stay engaged"
+
+
+async def test_set_monitor_skips_the_release_when_the_level_write_fails(
+    mock: MockEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with context(mock) as ctx:
+        await mock.push(MONITOR_MUTE, True)
+        real_set = ctx.client.set_value
+
+        async def flaky_set(path: str, value: Any) -> Any:
+            if path == MONITOR_LEVEL:
+                raise UAConnectError("the control socket went away mid-write")
+            return await real_set(path, value)
+
+        monkeypatch.setattr(ctx.client, "set_value", flaky_set)
+        result = await srv.tool_set_monitor(ctx, level_db=-40.0, mute=False)
+
+    assert result["ok"] is False
+    assert any("Skipped releasing Mute" in error for error in result["errors"])
+    assert mock.value(MONITOR_MUTE) is True
+
+
+async def test_set_monitor_still_engages_a_mute_when_the_level_write_fails(
+    mock: MockEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only RELEASES are skipped: getting quieter must never be blocked by a failed read."""
+    async with context(mock) as ctx:
+        real_set = ctx.client.set_value
+
+        async def flaky_set(path: str, value: Any) -> Any:
+            if path == MONITOR_LEVEL:
+                raise UAConnectError("the control socket went away mid-write")
+            return await real_set(path, value)
+
+        monkeypatch.setattr(ctx.client, "set_value", flaky_set)
+        result = await srv.tool_set_monitor(ctx, level_db=-40.0, mute=True)
+
+    assert result["ok"] is False, "the level write still failed"
+    assert mock.value(MONITOR_MUTE) is True
+
+
+async def test_unmuting_the_monitor_fails_closed_when_the_level_cannot_be_read(
+    mock: MockEngine,
+) -> None:
+    """B1: an unreadable CRMonitorLevel must refuse the unmute, not log and allow it."""
+    async with context(mock) as ctx:
+        await mock.push(MONITOR_MUTE, True)
+        await mock.push(MONITOR_LEVEL, None)
+        by_monitor = await srv.tool_set_monitor(ctx, mute=False)
+        by_channel = await srv.tool_set_channels(
+            ctx, [{"target": "MONITOR", "kind": "output", "mute": False}]
+        )
+    assert by_monitor["ok"] is False
+    assert "CRMonitorLevel" in by_monitor["errors"][0]
+    assert by_channel["ok"] is False
+    assert "CRMonitorLevel" in by_channel["results"][0]["errors"][0]
+    assert mock.value(MONITOR_MUTE) is True
 
 
 async def test_unmuting_onto_an_above_ceiling_level_is_refused(mock: MockEngine) -> None:
@@ -475,6 +750,136 @@ async def test_repeat_talkback_calls_replace_the_timer(mock: MockEngine) -> None
         assert mock.value("/TalkbackOn") is False
 
 
+async def test_talkback_arms_the_timer_even_when_the_level_write_fails(
+    mock: MockEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M6: a failed level write must never leave talkback open with nothing to close it."""
+    async with context(mock) as ctx:
+        real_set = ctx.client.set_value
+
+        async def flaky_set(path: str, value: Any) -> Any:
+            if path == "/TalkbackMaster":
+                raise UAConnectError("the control socket went away mid-write")
+            return await real_set(path, value)
+
+        monkeypatch.setattr(ctx.client, "set_value", flaky_set)
+        result = await srv.tool_talkback(ctx, on=True, level=60, auto_off_s=0.1)
+
+        assert result["ok"] is False, "the level failure is still reported"
+        assert result["errors"]
+        assert result["auto_off_armed"] is True, "talkback is ON: the timer must be armed"
+        assert mock.value("/TalkbackOn") is True
+        assert await wait_until(lambda: mock.value("/TalkbackOn") is False)
+
+
+async def test_talkback_does_not_arm_a_timer_when_the_gate_refuses(mock: MockEngine) -> None:
+    """A policy refusal is the one case where talkback provably never opened."""
+    async with context(mock, "readonly") as ctx:
+        result = await srv.tool_talkback(ctx, on=True, level=60, auto_off_s=0.1)
+        assert result["ok"] is False
+        assert "UAD_MCP_MODE" in " ".join(result["errors"])
+        assert result["auto_off_armed"] is False
+        assert ctx.talkback_timer_running is False
+        assert mock.value("/TalkbackOn") is False
+        assert mock.set_count() == 0
+
+
+async def test_talkback_arms_the_timer_when_the_ack_is_lost(
+    mock: MockEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M6: a write that reached the engine but never came back is UNKNOWN, so arm the timer.
+
+    This is the shape that leaves an open mic: the set frame landed, the ack did not.
+    """
+    async with context(mock) as ctx:
+        real_set = ctx.client.set_value
+        swallowed: list[str] = []
+
+        async def lost_ack(path: str, value: Any) -> Any:
+            applied = await real_set(path, value)
+            if path == "/TalkbackOn" and value is True and not swallowed:
+                swallowed.append(path)
+                raise UATimeoutError("no reply from UA Mixer Engine for set /TalkbackOn within 2s")
+            return applied
+
+        monkeypatch.setattr(ctx.client, "set_value", lost_ack)
+        result = await srv.tool_talkback(ctx, on=True, auto_off_s=0.05)
+
+        assert result["ok"] is False, "the lost ack is still reported"
+        assert mock.value("/TalkbackOn") is True, "talkback really did open"
+        assert result["auto_off_armed"] is True, "an open mic must never be left without a timer"
+        assert await wait_until(lambda: mock.value("/TalkbackOn") is False)
+
+
+async def test_talkback_auto_off_retries_before_giving_up(
+    mock: MockEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M7: one dropped write must not end the attempt to close an open talkback mic."""
+    async with context(mock, talkback_retry_delays_s=(0.01, 0.01, 0.01)) as ctx:
+        real_set = ctx.client.set_value
+        attempts: list[Any] = []
+
+        async def flaky_set(path: str, value: Any) -> Any:
+            if path == "/TalkbackOn" and value is False:
+                attempts.append(value)
+                if len(attempts) < 2:
+                    raise UAConnectError("the control socket went away mid-write")
+            return await real_set(path, value)
+
+        monkeypatch.setattr(ctx.client, "set_value", flaky_set)
+        await srv.tool_talkback(ctx, on=True, auto_off_s=0.01)
+        assert await wait_until(lambda: mock.value("/TalkbackOn") is False)
+        assert len(attempts) == 2, "the first attempt failed and the second one closed it"
+        assert ctx.talkback_auto_off_failed is False
+
+
+async def test_talkback_auto_off_failure_is_reported_in_status(
+    mock: MockEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M7: when every retry fails, say so - talkback may still be open."""
+    async with context(mock, talkback_retry_delays_s=(0.01, 0.01, 0.01)) as ctx:
+        real_set = ctx.client.set_value
+        attempts: list[Any] = []
+
+        async def always_fails(path: str, value: Any) -> Any:
+            if path == "/TalkbackOn" and value is False:
+                attempts.append(value)
+                raise UAConnectError("the control socket went away mid-write")
+            return await real_set(path, value)
+
+        monkeypatch.setattr(ctx.client, "set_value", always_fails)
+        await srv.tool_talkback(ctx, on=True, auto_off_s=0.01)
+        assert await wait_until(lambda: ctx.talkback_auto_off_failed)
+        assert len(attempts) == 3, "3 attempts, then give up loudly"
+        monkeypatch.setattr(ctx.client, "set_value", real_set)
+        status = await srv.tool_get_status(ctx)
+
+    assert status["talkback"]["auto_off_failed"] is True
+    assert status["talkback"]["on"] is True, "and talkback really is still open"
+
+
+async def test_arming_the_timer_again_clears_a_previous_failure(mock: MockEngine) -> None:
+    async with context(mock) as ctx:
+        ctx.talkback_auto_off_failed = True
+        await srv.tool_talkback(ctx, on=True, auto_off_s=5.0)
+        assert ctx.talkback_auto_off_failed is False
+
+
+@pytest.mark.parametrize("close", ["talkback", "safe_state"])
+async def test_closing_talkback_by_hand_clears_the_failure_flag(
+    mock: MockEngine, close: str
+) -> None:
+    async with context(mock) as ctx:
+        await mock.push("/TalkbackOn", True)
+        ctx.talkback_auto_off_failed = True
+        if close == "talkback":
+            await srv.tool_talkback(ctx, on=False)
+        else:
+            await srv.tool_safe_state(ctx)
+        assert mock.value("/TalkbackOn") is False
+        assert ctx.talkback_auto_off_failed is False, "talkback is shut; stop crying wolf"
+
+
 async def test_talkback_needs_something_to_do(mock: MockEngine) -> None:
     async with context(mock) as ctx:
         result = await srv.tool_talkback(ctx)
@@ -538,6 +943,61 @@ async def test_set_clock_reverts_itself_when_lock_fails(mock: MockEngine) -> Non
     assert "same sample rate" in result["error"]
     assert mock.value("/ClockSource") == "Internal", "the clock source must be back where it was"
     assert result["revert"]["after"] == "Internal"
+
+
+async def test_set_clock_survives_a_failed_auto_revert(
+    mock: MockEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M5: if the revert itself fails, the result must still come back and say so."""
+    async with context(mock) as ctx:
+        await mock.push("/ClockLocked", False)
+        real_set = ctx.client.set_value
+        writes: list[Any] = []
+
+        async def flaky_set(path: str, value: Any) -> Any:
+            if path == "/ClockSource":
+                writes.append(value)
+                if len(writes) > 1:
+                    raise UAConnectError("the control socket went away mid-revert")
+            return await real_set(path, value)
+
+        monkeypatch.setattr(ctx.client, "set_value", flaky_set)
+        result = await srv.tool_set_clock(ctx, "ADAT", confirm=True)
+
+    assert result["ok"] is False
+    assert result["reverted"] is False
+    assert "UA Mixer Engine not reachable" in result["revert_error"]
+    assert "left at 'ADAT' and unlocked" in result["error"]
+    assert "uad_set_clock(source='Internal', confirm=true)" in result["error"]
+    # The populated result survived: the model can still see what happened before the revert.
+    assert result["write"]["after"] == "ADAT"
+    assert result["locked"] is False
+    assert mock.value("/ClockSource") == "ADAT", "the rig really is left on the new source"
+
+
+async def test_set_clock_reverts_even_when_the_lock_recheck_fails(
+    mock: MockEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed re-read of ClockLocked must not be reported as a failed revert."""
+    async with context(mock) as ctx:
+        await mock.push("/ClockLocked", False)
+        real_value = ctx.value
+        reads: list[str] = []
+
+        async def flaky_value(path: str, default: Any = None) -> Any:
+            reads.append(path)
+            if path == "/ClockLocked" and len(reads) > 1:
+                raise UAConnectError("the control socket went away mid-read")
+            return await real_value(path, default)
+
+        monkeypatch.setattr(ctx, "value", flaky_value)
+        result = await srv.tool_set_clock(ctx, "ADAT", confirm=True)
+
+    assert result["reverted"] is True, "the revert write itself succeeded"
+    assert result["locked_after_revert"] is None, "unknown, not false"
+    assert "revert_error" not in result
+    assert "reverted to 'Internal'" in result["error"]
+    assert mock.value("/ClockSource") == "Internal"
 
 
 async def test_set_clock_rejects_an_unknown_source(mock: MockEngine) -> None:
@@ -905,6 +1365,34 @@ async def test_snapshot_cross_model_refusal_is_actionable(
     assert twin.set_count() == 0
 
 
+async def test_default_snapshot_names_are_utc(
+    mock: MockEngine, snapshot_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """m8: the auto-generated name must agree with the document's own UTC `created` field.
+
+    The process timezone is forced away from UTC for the duration, so this cannot pass by
+    accident on a UTC machine.
+    """
+    monkeypatch.setenv("TZ", "Asia/Tokyo")
+    time.tzset()
+    monkeypatch.setattr(time, "tzset", lambda: None, raising=False)
+    try:
+        assert time.strftime("%H", time.localtime()) != time.strftime("%H", time.gmtime())
+        async with context(mock) as ctx:
+            before = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+            saved = await srv.tool_snapshot(ctx, action="save")
+            after = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+    stamp = saved["name"].removeprefix("snapshot-")
+    assert before <= stamp <= after, f"{saved['name']} is not a UTC timestamp"
+    doc = snap.SnapshotStore(snapshot_dir).load(saved["name"])
+    created = doc["created"].replace("-", "").replace(":", "").replace("Z", "")
+    assert created[:8] == stamp[:8]
+    assert created[9:13] == stamp[9:13], f"{doc['created']} and {saved['name']} disagree"
+
+
 async def test_snapshot_bad_action_and_missing_name(mock: MockEngine) -> None:
     async with context(mock) as ctx:
         bad = await srv.tool_snapshot(ctx, action="destroy")
@@ -958,6 +1446,97 @@ async def test_full_mode_still_rails_the_monitor(mock: MockEngine) -> None:
     assert mock.value(MONITOR_LEVEL) == -22.0
 
 
+@pytest.mark.parametrize("prop", ["Mute", "DimOn"])
+async def test_raw_set_rails_a_monitor_release_against_the_stored_level(
+    mock: MockEngine, prop: str
+) -> None:
+    """B1: uad_raw_set can reach the monitor directly, so it must find the rail too."""
+    async with context(mock, "full") as ctx:
+        await mock.push(MONITOR_LEVEL, -2.0)
+        await mock.push(f"{MONITOR}/{prop}", True)
+        result = await srv.tool_raw_set(ctx, f"{MONITOR}/{prop}", False)
+    assert result["ok"] is False
+    assert "UAD_MCP_MAX_MONITOR_DB" in result["error"]
+    assert mock.value(f"{MONITOR}/{prop}") is True
+
+
+@pytest.mark.parametrize("prop", ["Mute", "DimOn"])
+async def test_raw_set_refuses_a_monitor_release_when_the_level_read_fails(
+    mock: MockEngine, prop: str
+) -> None:
+    """B1: an unreadable level is a refusal, not a free pass."""
+    async with context(mock, "full") as ctx:
+        await mock.push(f"{MONITOR}/{prop}", True)
+        await mock.push(MONITOR_LEVEL, None)
+        result = await srv.tool_raw_set(ctx, f"{MONITOR}/{prop}", False)
+    assert result["ok"] is False
+    assert "CRMonitorLevel" in result["error"]
+    assert mock.value(f"{MONITOR}/{prop}") is True
+
+
+async def test_raw_set_refuses_a_monitor_release_when_the_level_never_answers(
+    mock_factory: Any, base_fixture: Tree
+) -> None:
+    """The reviewer's case: the sibling read times out, so the rail cannot be evaluated."""
+    engine = await mock_factory(base_fixture, never_reply_on={MONITOR_LEVEL})
+    async with context(engine, "full") as ctx:
+        await engine.push(MONITOR_MUTE, True)
+        result = await srv.tool_raw_set(ctx, MONITOR_MUTE, False)
+    assert result["ok"] is False
+    assert "CRMonitorLevel" in result["error"]
+    assert engine.value(MONITOR_MUTE) is True
+
+
+@pytest.mark.parametrize("spelling", [False, 0, "no", "n", "off", "false"])
+async def test_raw_set_rails_every_spelling_of_a_monitor_release(
+    mock: MockEngine, spelling: Any
+) -> None:
+    """B1: the gate coerces "n" and 0 to False, so the rail must recognise them as releases."""
+    async with context(mock, "full") as ctx:
+        await mock.push(MONITOR_LEVEL, -2.0)
+        await mock.push(MONITOR_MUTE, True)
+        result = await srv.tool_raw_set(ctx, MONITOR_MUTE, spelling)
+    assert result["ok"] is False, f"{spelling!r} slipped past the monitor rail"
+    assert "UAD_MCP_MAX_MONITOR_DB" in result["error"]
+    assert mock.value(MONITOR_MUTE) is True
+
+
+async def test_raw_set_can_lower_the_dim_attenuation_when_it_is_safe(mock: MockEngine) -> None:
+    """Full mode must stay usable: with dim off, the attenuation is not in circuit at all."""
+    async with context(mock, "full") as ctx:
+        allowed = await srv.tool_raw_set(ctx, DIM_ATTENUATION, 0)
+        assert allowed["ok"] is True, allowed
+        assert mock.value(DIM_ATTENUATION) == 0
+
+        await mock.push(DIM_ATTENUATION, 17)
+        await mock.push(MONITOR_DIM, True)
+        await mock.push(MONITOR_LEVEL, 0.0)
+        refused = await srv.tool_raw_set(ctx, DIM_ATTENUATION, 0)
+    assert refused["ok"] is False, "dimmed, with a hot stored level, this is an un-dim"
+    assert "UAD_MCP_MAX_MONITOR_DB" in refused["error"]
+    assert mock.value(DIM_ATTENUATION) == 17
+
+
+async def test_raw_set_leaves_ordinary_outputs_alone(mock: MockEngine) -> None:
+    """An output with no CRMonitorLevel is not the control room: is_monitor stays False."""
+    headphones = "/devices/0/outputs/23"
+    mock.nodes[headphones]["properties"]["Mute"] = {"type": "bool", "value": True}
+    async with context(mock, "full") as ctx:
+        result = await srv.tool_raw_set(ctx, f"{headphones}/Mute", False)
+    assert result["ok"] is True, result
+    assert mock.value(f"{headphones}/Mute") is False
+
+
+async def test_raw_set_does_not_hunt_for_a_monitor_level_on_inputs(mock: MockEngine) -> None:
+    async with context(mock, "full") as ctx:
+        await mock.push(f"{IN0}/Mute", True)
+        before = len(mock.sent_frames)
+        result = await srv.tool_raw_set(ctx, f"{IN0}/Mute", False)
+    assert result["ok"] is True
+    frames = mock.sent_frames[before:]
+    assert not [frame for frame in frames if "CRMonitorLevel" in frame]
+
+
 # ------------------------------------------------------------------------------- readonly
 
 
@@ -967,7 +1546,10 @@ async def test_readonly_mode_puts_zero_sets_on_the_wire(
     """SPEC §4.7: exercise EVERY write tool in readonly mode; ``set_count()`` must stay 0."""
     monkeypatch.setattr(snap, "MATERIALIZE_TIMEOUT_S", 0.1)
     monkeypatch.setattr(snap, "MATERIALIZE_POLL_S", 0.05)
-    async with context(mock, "readonly") as ctx:
+    # A generous token bucket: refusals spend tokens too, and the point here is that EVERY tool
+    # is refused for being in readonly mode, not that some of them ran out of rate limit.
+    readonly = SafetyGate("readonly", writes_per_second=500.0, write_burst=500)
+    async with context(mock, gate=readonly) as ctx:
         # A snapshot to restore, and engine-side drift so the restore really has work to do.
         await srv.tool_snapshot(ctx, action="save", name="ro")
         await mock.push(f"{IN0}/Name", "SCRAMBLED")
@@ -1055,6 +1637,80 @@ async def test_topology_is_cached_until_the_ttl_expires(mock: MockEngine) -> Non
         assert ctx.discoveries == 2
         await ctx.rig(refresh=True)
         assert ctx.discoveries == 3
+
+
+async def test_a_walk_invalidated_mid_flight_is_discarded_and_redone(
+    mock: MockEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """m7: a reconnect during the walk must not be papered over by a stale timestamp."""
+    now = [1000.0]
+    async with context(mock, rig_ttl_s=30.0, clock=lambda: now[0]) as ctx:
+        real_discover = srv.discover
+        calls: list[int] = []
+
+        async def racing_discover(client: Any) -> Any:
+            calls.append(1)
+            rig = await real_discover(client)
+            if len(calls) == 1:
+                # As if the control socket reconnected while we were still walking.
+                ctx.invalidate()
+            return rig
+
+        monkeypatch.setattr(srv, "discover", racing_discover)
+        rig = await ctx.rig()
+
+        assert len(calls) == 2, "the invalidated walk must be thrown away and re-walked"
+        assert ctx.discoveries == 2
+        assert len(rig.channels) == X8_CHANNELS
+        assert ctx.topology_stale is False, "the surviving walk is cached, not left stale"
+        # And the cache really is usable: no further walk while inside the TTL.
+        await ctx.rig()
+        assert len(calls) == 2
+
+
+async def test_a_walk_that_never_settles_is_served_but_never_cached(
+    mock: MockEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """m7: if every attempt is invalidated, do not hand out stale topology for a full TTL."""
+    now = [1000.0]
+    async with context(mock, rig_ttl_s=30.0, clock=lambda: now[0]) as ctx:
+        real_discover = srv.discover
+        calls: list[int] = []
+
+        async def always_racing(client: Any) -> Any:
+            calls.append(1)
+            rig = await real_discover(client)
+            ctx.invalidate()
+            return rig
+
+        monkeypatch.setattr(srv, "discover", always_racing)
+        rig = await ctx.rig()
+        assert len(calls) == srv.RIG_WALK_ATTEMPTS
+        assert len(rig.channels) == X8_CHANNELS, "the caller still gets a usable topology"
+        assert ctx.topology_stale is True, "but it must not be served again from cache"
+        await ctx.rig()
+        assert len(calls) == 2 * srv.RIG_WALK_ATTEMPTS
+
+
+async def test_the_rig_timestamp_is_stamped_after_the_walk(
+    mock: MockEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """m7: a slow walk must not come back already half-expired."""
+    now = [1000.0]
+    async with context(mock, rig_ttl_s=30.0, clock=lambda: now[0]) as ctx:
+        real_discover = srv.discover
+
+        async def slow_discover(client: Any) -> Any:
+            now[0] += 25.0  # the walk itself took 25 s
+            return await real_discover(client)
+
+        monkeypatch.setattr(srv, "discover", slow_discover)
+        await ctx.rig()
+        assert ctx.topology_stale is False
+        now[0] += 20.0
+        assert ctx.topology_stale is False, "20 s after the walk finished it is still fresh"
+        now[0] += 11.0
+        assert ctx.topology_stale is True
 
 
 async def test_concurrent_callers_share_one_discovery(mock: MockEngine) -> None:
@@ -1266,6 +1922,75 @@ def test_sanitize_scrubs_the_home_directory() -> None:
     assert cleaned["nodes"]["/y"] == ["~", 42, True, None]
 
 
+def test_sanitize_redacts_hardware_identity_values() -> None:
+    """B3: a dumped tree is meant to be shareable, so serials and firmware do not travel."""
+    payload = {
+        "nodes": {
+            "/": {
+                "properties": {
+                    "SerialNumber": {"type": "string", "value": "24492087001847"},
+                    "Version": {"type": "string", "value": "11.7.1"},
+                }
+            },
+            "/devices/0": {
+                "properties": {
+                    "DeviceHwID": {"type": "int64", "value": 987654321},
+                    "FirmwareVersion": {"type": "string", "value": "5.4.3", "default": "0.0.0"},
+                    "BootloaderVersion": {"type": "string", "value": "1.2"},
+                    "DeviceName": {"type": "string", "value": "Apollo x8 Gen 2"},
+                }
+            },
+        }
+    }
+    cleaned = cli.sanitize(payload, "/Users/someone")
+    root = cleaned["nodes"]["/"]["properties"]
+    device = cleaned["nodes"]["/devices/0"]["properties"]
+    assert root["SerialNumber"] == {"type": "string", "value": "0"}
+    assert device["DeviceHwID"] == {"type": "int64", "value": 0}
+    assert device["FirmwareVersion"] == {"type": "string", "value": "0", "default": "0"}
+    assert device["BootloaderVersion"]["value"] == "0"
+    # Everything that is not hardware identity survives untouched.
+    assert root["Version"]["value"] == "11.7.1"
+    assert device["DeviceName"]["value"] == "Apollo x8 Gen 2"
+
+
+def test_the_committed_fixture_carries_no_real_serial_number(base_fixture: Tree) -> None:
+    """B3: the fixture is public. Its serial must be blanked, and the property kept."""
+    assert base_fixture["nodes"]["/"]["properties"]["SerialNumber"] == {
+        "type": "string",
+        "value": "0",
+    }
+    assert "24492087001847" not in json.dumps(base_fixture)
+
+
+def test_an_unusable_safety_mode_is_a_configuration_error_not_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """m2: exit code 2 and one sentence on stderr, for every CLI mode."""
+    monkeypatch.setenv("UAD_MCP_MODE", "yolo")
+    monkeypatch.setattr(cli, "serve", _refuse_to_serve)
+    monkeypatch.setattr(cli, "_run_check", _refuse_to_connect)
+    for argv in ([], ["--check"], ["--dump-tree", "-"]):
+        assert cli.main(argv) == cli.CONFIG_ERROR_EXIT, argv
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "UAD_MCP_MODE='yolo' is not a valid safety mode" in captured.err
+    assert "readonly, safe, full" in captured.err
+
+
+def test_a_bad_numeric_limit_is_also_a_configuration_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("UAD_MCP_MAX_MONITOR_DB", "loud")
+    monkeypatch.setattr(cli, "serve", _refuse_to_serve)
+    assert cli.main([]) == cli.CONFIG_ERROR_EXIT
+    assert "UAD_MCP_MAX_MONITOR_DB='loud' is not a number" in capsys.readouterr().err
+
+
+def _refuse_to_serve(host: str, port: int) -> int:  # pragma: no cover - guard only
+    raise AssertionError("a broken configuration must never reach serve()")
+
+
 async def test_doctor_reports_a_healthy_rig(mock: MockEngine) -> None:
     client = UAClient(port=mock.port)
     try:
@@ -1322,6 +2047,7 @@ async def test_dump_tree_walks_and_sanitizes(
         cli.Path, "home", classmethod(lambda cls: Path("/Users/someone"))  # type: ignore[arg-type]
     )
     await mock.push(f"{IN0}/Name", "/Users/someone/secret")
+    await mock.push("/SerialNumber", "24492087001847")  # as a real engine would report it
     client = UAClient(port=mock.port, tree_timeout=30.0)
     try:
         document = await cli.dump_tree(client)
@@ -1330,6 +2056,9 @@ async def test_dump_tree_walks_and_sanitizes(
     assert document["_meta"]["node_count"] == len(document["nodes"]) == 1941
     assert document["nodes"][IN0]["properties"]["Name"]["value"] == "~/secret"
     assert "children" in document["nodes"]["/devices/0"]
+    # B3: a dumped tree is a fixture people paste into issues. No serial travels with it.
+    assert document["nodes"]["/"]["properties"]["SerialNumber"]["value"] == "0"
+    assert "24492087001847" not in json.dumps(document)
 
 
 def test_run_dump_writes_the_file(
@@ -1395,3 +2124,42 @@ async def test_rename_updates_cached_topology_immediately(mock: MockEngine) -> N
         assert second["ok"] is True, second
         assert second["results"][0]["resolved"]["name"] == "LEAD VOX"
         assert ctx.discoveries == walked
+
+
+async def test_set_sends_warns_on_phantom_cue_bus(mock: MockEngine) -> None:
+    """The x8 exposes cue3/cue4 send nodes but reports CueBusCount=2: a write there must
+    verify AND carry a warning that the bus does not reach any real output."""
+    async with context(mock) as ctx:
+        result = await srv.tool_set_sends(
+            ctx, [{"target": "ANALOG 1", "send": "cue3", "level_db": -20.0}]
+        )
+    item = result["results"][0]
+    assert item["ok"] is True
+    assert any("does not reach any real output" in w for w in item["writes"][0]["warnings"])
+    async with context(mock) as ctx:
+        real_result = await srv.tool_set_sends(
+            ctx, [{"target": "ANALOG 1", "send": "cue1", "level_db": -20.0}]
+        )
+    assert real_result["results"][0]["writes"][0]["warnings"] == []
+
+
+async def test_auto_off_failure_is_not_alarmed_when_talkback_never_opened(
+    mock: MockEngine,
+) -> None:
+    """If every auto-off write fails but TalkbackOn already reads false (the mic never
+    actually opened), the failure flag must stay down: it is the one flag an operator
+    has to be able to trust."""
+    async with context(mock) as ctx:
+        ctx.talkback_retry_delays_s = (0.0,)
+
+        async def failing_write(*args: object, **kwargs: object) -> None:
+            raise UAConnectError("socket dropped")
+
+        ctx.write = failing_write  # type: ignore[method-assign]
+        assert mock.value("/TalkbackOn") is False
+        await ctx._talkback_auto_off(0.0)
+        assert ctx.talkback_auto_off_failed is False
+
+        await mock.push("/TalkbackOn", True)
+        await ctx._talkback_auto_off(0.0)
+        assert ctx.talkback_auto_off_failed is True

@@ -209,17 +209,28 @@ Rules:
   `Name, FaderLevel, Pan, Pan2, Mute, Solo, SoloSafe, ChannelHidden, Gain, 48V, Pad, Phase,
   LowCut, HiZ, IOType, Bypass, PostFaderOverride, EffectName, Preset, Power, NormalizedValue,
   CRMonitorLevel, DimOn, MixToMono, DimAttenuation, TalkbackOn, TalkbackMaster,
-  TalkbackEnabled, AltMonSelection, ClockSource, SampleRate, StereoName, Stereo, EnabledByUser`
+  TalkbackEnabled, AltMonSelection, ClockSource, SampleRate, StereoName, Stereo, EnabledByUser, SRConvert`
   Clock and sample-rate additionally require the tool-level confirm gates.
 - `full`: allowlist bypassed (raw set enabled) but monitor rail and rate limit still apply.
 - Denylist in ALL modes: `DeviceHwID`, `MultiUnitOrder`, `AppCommand`, `MixerState`,
   anything under `/pluginscenes` writes, firmware/system props.
 - Monitor rail: ceiling `UAD_MCP_MAX_MONITOR_DB` (default -6.0); max +6 dB increase per call;
-  rolling max +10 dB per 30 s window; unmute and un-dim count as level events: if the stored
-  level exceeds the ceiling, refuse with the exact remedy.
-- RULE FOR NEW TOOLS: any tool writing monitor `Mute` or `DimOn` MUST pass the current
-  monitor level in `WriteContext.monitor_level_db`, because the gate cannot see topology and only
-  logs (does not refuse) when the context is missing.
+  rolling max +10 dB per 30 s window. Unmute, un-dim AND a `DimAttenuation` DECREASE while
+  `DimOn` is true all count as level events: if the level the release would expose
+  (`CRMonitorLevel`, or `CRMonitorLevel - DimAttenuation` for the dim case) exceeds the ceiling,
+  refuse with the exact remedy. Raising `DimAttenuation` is always allowed - it only attenuates.
+- RULE FOR NEW TOOLS: any tool writing monitor `Mute`, `DimOn` or `DimAttenuation` MUST pass
+  `WriteContext.is_monitor=True` plus what the rail needs (`monitor_level_db`, and `dim_on` for
+  `DimAttenuation`), because the gate cannot see topology. With `is_monitor=True` a missing level
+  is a FAILED READ and the write is REFUSED (fail closed); without it the gate can only log.
+  `monitor_level_db` must be the level the ENGINE reported back, never the requested one.
+- RULE FOR NEW TOOLS: "is this write a release?" is `safety.coerces_to_false(value)`, never
+  `value is False`. The gate coerces `0`, `"no"`, `"n"`, `"off"`; an identity test lets exactly
+  those spellings past the rail.
+- The write rate limiter is charged inside `check_write`, for refusals as well as allowed writes
+  (the caller already spent a property read to get there) - but AFTER the readonly-mode and
+  denylist checks, which are permanent: answering those with "retry in 0.1 s" would invite a
+  retry loop that can never succeed.
 - Values clamped to the property's own min/max metadata; enums validated against `values`.
 - Global token-bucket rate limit: 10 writes/s, burst 20.
 - 48V writes require `confirm_condenser_mic=True` flowing in from the tool layer via `context`.
@@ -230,7 +241,11 @@ Rules:
 
 - `capture(client, rig) -> dict`: walks devices, keeps ONLY allowlisted-writable properties
   (same list as safety `safe` mode, minus ClockSource/SampleRate which are captured into
-  `_meta` but not restored by default). Each entry: `{path, value, meta: {type,min,max,values}}`.
+  `_meta` but not restored by default), PLUS the allowlisted properties that live at `/` rather
+  than under `/devices` (the talkback pair `TalkbackOn`/`TalkbackMaster`), restored last in a
+  `ROOT` phase. `TalkbackOn: true` is captured but NEVER restored (a restore would open a live
+  mic with no auto-off timer behind it); it is reported as skipped, naming `uad_talkback`.
+  Each entry: `{path, value, meta: {type,min,max,values}}`.
   Doc: `{schema_version: 1, created: iso8601, devices: [...], sample_rate, entries: [...]}`.
 - Files: `~/.uad-console-mcp/snapshots/<name>.json`. `list_snapshots()`, `load(name)`.
 - `diff(client, rig, doc, ignore: list[str]) -> list[Change]`: glob patterns against paths.
@@ -240,7 +255,9 @@ Rules:
      (then map channels by IOType + ordinal, never raw index);
   3. ordering: unlink stereo pairs → EffectName loads (poll for parameters to materialize,
      5 s timeout per slot) → plugin Presets → parameters → Unison → sends → fader/pan/mute/
-     solo/name/hidden → relink stereo → (opt-in) monitor, clamped through SafetyGate;
+     solo/name/hidden → relink stereo → (opt-in) monitor, clamped through SafetyGate → root
+     (talkback). Monitor strips are the UNION of the document's and the live rig's, so a strip
+     that is the control-room output now cannot escape the rail;
   4. per-entry failures collected, never abort mid-way: returns `{applied, skipped, failed}`
      with reasons; dry-run returns the exact ordered write list.
 
@@ -322,8 +339,11 @@ reconnect where the fixture swapped to the twin (channel count changed); readonl
 sequence of uad_set_monitor calls can exceed the ceiling; snapshot round-trip on cascade
 fixture; cross-model restore refusal (x8 doc → twin fixture); golden-shape tests for
 uad_get_status / uad_list_channels / uad_set_channels outputs; 60 s random-call soak
-(marked slow) asserting no unhandled exceptions, no leaked tasks/sockets. Live tests exist
-under `tests/live/` marked `live`, skipped unless `UAD_MCP_LIVE=1`.
+(`tests/test_soak.py`, marked `slow`) asserting no unhandled exceptions, the monitor ceiling
+never exceeded on the wire, and no leaked tasks/sockets. Default `addopts` deselect both
+markers (`-m 'not live and not slow'`); run the soak with `pytest tests/test_soak.py -m slow`
+(`UAD_MCP_SOAK_SECONDS` shortens it). Live tests exist under `tests/live/` marked `live`,
+skipped unless `UAD_MCP_LIVE=1`.
 
 ## 5. Attribution & legal (for docs authors)
 

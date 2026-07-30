@@ -35,11 +35,14 @@ from typing import Any
 from .client import UAClient, UAError, UAPathError
 from .discovery import DEVICES_PATH, ChannelInfo, Rig
 from .safety import (
+    DIM_ATTENUATION_PROPERTY,
+    DIM_ON_PROPERTY,
     MONITOR_RELEASE_PROPERTIES,
     WRITABLE_PROPERTIES,
     SafetyGate,
     SafetyRefusal,
     WriteContext,
+    coerces_to_false,
     property_name,
 )
 
@@ -56,8 +59,13 @@ CLOCK_PROPERTIES: frozenset[str] = frozenset({"ClockSource", "SampleRate"})
 CAPTURED_PROPERTIES: frozenset[str] = WRITABLE_PROPERTIES - CLOCK_PROPERTIES
 """Exactly the ``safe``-mode allowlist minus the two transport-wide properties."""
 
-DEVICE_MONITOR_PROPERTIES: frozenset[str] = frozenset({"DimAttenuation", "AltMonSelection"})
+DEVICE_MONITOR_PROPERTIES: frozenset[str] = frozenset(
+    {DIM_ATTENUATION_PROPERTY, "AltMonSelection"}
+)
 """Device-level properties that belong to the monitor rail rather than to a channel."""
+
+TALKBACK_ON_PROPERTY = "TalkbackOn"
+"""Talkback lives at ``/``, not under ``/devices``, so the device walk never sees it."""
 
 MATERIALIZE_TIMEOUT_S = 5.0
 """Per-slot budget for plugin parameter nodes to appear after an ``EffectName`` write."""
@@ -114,6 +122,8 @@ class Phase(IntEnum):
     CHANNEL = 7
     RELINK_STEREO = 8
     MONITOR = 9
+    ROOT = 10
+    """Engine-wide properties at ``/`` (talkback), restored after every strip is in place."""
 
 
 _PROPERTY_RANK: dict[str, int] = {
@@ -126,7 +136,7 @@ _PROPERTY_RANK: dict[str, int] = {
     "Power": 3,
     "Bypass": 4,
     MONITOR_LEVEL_PROPERTY: 0,
-    "DimAttenuation": 1,
+    DIM_ATTENUATION_PROPERTY: 1,
     "Mute": 2,
     "DimOn": 3,
 }
@@ -436,9 +446,10 @@ async def capture(client: UAClient, rig: Rig, *, name: str | None = None) -> dic
                     "meta": _entry_meta(meta),
                 }
             )
+    root_properties, _ = await client.get_node("/")
+    entries.extend(_root_entries(root_properties))
     entries.sort(key=lambda entry: entry["path"])
 
-    root_properties, _ = await client.get_node("/")
     sample_rate = _root_value(root_properties, "SampleRate")
     clock_source = _root_value(root_properties, "ClockSource")
 
@@ -475,6 +486,40 @@ async def capture(client: UAClient, rig: Rig, *, name: str | None = None) -> dic
 def _root_value(properties: Mapping[str, Any], name: str) -> Any:
     prop = properties.get(name)
     return None if prop is None else prop.value
+
+
+def _root_entries(properties: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Allowlisted properties that live at ``/`` rather than under ``/devices``.
+
+    In practice this is the talkback pair (``TalkbackOn``, ``TalkbackMaster``): the server can
+    write them, so a snapshot that claims to hold everything writable has to carry them too.
+    """
+    entries: list[dict[str, Any]] = []
+    for name, prop in properties.items():
+        if name not in CAPTURED_PROPERTIES:
+            continue
+        value = getattr(prop, "value", None)
+        if value is None:
+            logger.debug("skipping /%s: the engine reported no value", name)
+            continue
+        if getattr(prop, "readonly", False):
+            logger.debug("skipping read-only /%s", name)
+            continue
+        entries.append(
+            {
+                "path": f"/{name}",
+                "value": value,
+                "meta": _entry_meta(
+                    {
+                        "type": getattr(prop, "type", ""),
+                        "min": getattr(prop, "min", None),
+                        "max": getattr(prop, "max", None),
+                        "values": getattr(prop, "values", None),
+                    }
+                ),
+            }
+        )
+    return entries
 
 
 # -------------------------------------------------------------------------------------- diff
@@ -646,6 +691,9 @@ def _remap_path(
     mapping: Mapping[str, str],
     device_map: Mapping[int, int],
 ) -> str | None:
+    if not path.startswith(DEVICES_PATH + "/"):
+        # Engine-wide properties at "/" (talkback) exist on every model: nothing to remap.
+        return path
     for prefix in prefixes:
         if path == prefix or path.startswith(prefix + "/"):
             return mapping[prefix] + path[len(prefix) :]
@@ -662,6 +710,8 @@ def _remap_path(
 
 
 def _classify(path: str, prop: str, *, monitor: bool) -> Phase:
+    if not path.startswith(DEVICES_PATH + "/"):
+        return Phase.ROOT
     if "/preamps/" in path:
         return Phase.UNISON
     if "/sends/" in path:
@@ -684,6 +734,7 @@ def plan_restore(
     current: Mapping[str, Any] | None = None,
     include_clock: bool = False,
     include_monitor: bool = False,
+    monitor_paths: Sequence[str] | None = None,
 ) -> RestorePlan:
     """Build the exact ordered write list a restore would perform.
 
@@ -691,14 +742,16 @@ def plan_restore(
     ``entries`` defaults to every entry in ``doc``; the restore path passes only the entries
     that actually differ. ``current`` (live values keyed by path) is what lets the stereo
     unlink/relink pass fire only for pairs that are really linked right now.
+
+    ``monitor_paths`` overrides the monitor strips read out of ``doc``; :func:`restore` passes the
+    union with the LIVE rig's monitor strips, so a strip that is a monitor now cannot escape the
+    monitor rail just because the document does not know it is one.
     """
     plan = RestorePlan()
     source = doc.get("entries", []) if entries is None else entries
     live: Mapping[str, Any] = current or {}
-    monitor_paths = tuple(
-        str(channel["path"])
-        for channel in doc.get("channels", [])
-        if isinstance(channel, Mapping) and channel.get("is_monitor") and channel.get("path")
+    strips = (
+        doc_monitor_paths(doc) if monitor_paths is None else tuple(dict.fromkeys(monitor_paths))
     )
 
     if include_clock:
@@ -728,7 +781,7 @@ def plan_restore(
         path = str(entry["path"])
         prop = property_name(path)
         value = entry.get("value")
-        monitor = prop in DEVICE_MONITOR_PROPERTIES or _under_any(path, monitor_paths)
+        monitor = prop in DEVICE_MONITOR_PROPERTIES or _under_any(path, strips)
         if monitor and not include_monitor:
             plan.skipped.append(
                 {
@@ -736,6 +789,22 @@ def plan_restore(
                     "property": prop,
                     "value": value,
                     "reason": "monitor rail entry; pass include_monitor=true to restore it",
+                }
+            )
+            continue
+        if prop == TALKBACK_ON_PROPERTY and not coerces_to_false(value):
+            # Restoring talkback ON would open a live mic into the control room with no auto-off
+            # timer behind it (only uad_talkback arms one). Switching it OFF always restores.
+            plan.skipped.append(
+                {
+                    "path": path,
+                    "property": prop,
+                    "value": value,
+                    "reason": (
+                        "talkback was ON when this snapshot was taken; a restore will not open a "
+                        "live mic. Use uad_talkback(on=true) if you really want it, which also "
+                        "arms the auto-off timer"
+                    ),
                 }
             )
             continue
@@ -819,6 +888,26 @@ def _stereo_writes(
 
 def _under_any(path: str, prefixes: Sequence[str]) -> bool:
     return any(path == prefix or path.startswith(prefix + "/") for prefix in prefixes)
+
+
+def doc_monitor_paths(doc: Mapping[str, Any]) -> tuple[str, ...]:
+    """Monitor strips as the snapshot document remembers them."""
+    return tuple(
+        str(channel["path"])
+        for channel in doc.get("channels", [])
+        if isinstance(channel, Mapping) and channel.get("is_monitor") and channel.get("path")
+    )
+
+
+def monitor_paths_for(doc: Mapping[str, Any], rig: Rig) -> tuple[str, ...]:
+    """Every strip that is a monitor output in the document OR on the live rig.
+
+    Deriving these from the document alone leaves a live monitor strip unrailed whenever the two
+    disagree: a re-indexed model, a cross-model remap, or a document captured before the strip
+    became the control-room output.
+    """
+    live = tuple(channel.path for channel in rig.channels if channel.is_monitor)
+    return tuple(dict.fromkeys([*doc_monitor_paths(doc), *live]))
 
 
 # ------------------------------------------------------------------------------- materialize
@@ -927,12 +1016,14 @@ async def restore(
         else:
             changed.append(entry)
 
+    monitor_paths = monitor_paths_for(doc, rig)
     plan = plan_restore(
         doc,
         entries=changed,
         current=live,
         include_clock=include_clock,
         include_monitor=include_monitor,
+        monitor_paths=monitor_paths,
     )
     outcome = _Outcome(skipped=[*mapping_skipped, *missing, *plan.skipped])
 
@@ -957,7 +1048,14 @@ async def restore(
     if pre_restore:
         result["pre_restore_snapshot"] = await _capture_pre_restore(client, rig, store)
 
-    await _apply(client, gate, plan, outcome, audio_flowing=audio_flowing)
+    await _apply(
+        client,
+        gate,
+        plan,
+        outcome,
+        audio_flowing=audio_flowing,
+        monitor_paths=monitor_paths,
+    )
     result.update(
         applied=_capped(outcome.applied),
         skipped=_capped(outcome.skipped),
@@ -1023,12 +1121,16 @@ async def _apply(
     outcome: _Outcome,
     *,
     audio_flowing: bool | None,
+    monitor_paths: Sequence[str],
 ) -> None:
     limits = gate.describe()
-    interval = 1.0 / max(1.0, float(limits.get("writes_per_second") or 1.0))
+    # No max(1.0, ...): a deliberately slow UAD_MCP_WRITES_PER_SECOND (0.5/s) needs a LONGER
+    # interval than one second, not a shorter one, or the whole restore mass-fails on the limiter.
+    interval = 1.0 / max(1e-9, float(limits.get("writes_per_second") or 1.0))
     burst = max(1, int(limits.get("write_burst") or 1))
     dead_slots: set[str] = set()
-    written = 0
+    #: Gate decisions made so far, applied or refused: what the token bucket has been charged.
+    charged = 0
 
     for write in plan.writes:
         slot = write.slot
@@ -1052,22 +1154,25 @@ async def _apply(
             outcome.skipped.append(_record(write, reason="already at the snapshot value"))
             continue
 
-        context = await _context_for(client, write, audio_flowing=audio_flowing)
+        context = await _context_for(
+            client, write, audio_flowing=audio_flowing, monitor_paths=monitor_paths
+        )
+        if charged >= burst - 1:
+            # Stay inside the gate's token bucket instead of mass-failing a long restore. A
+            # refusal spends a token too, so it is paced exactly like an applied write.
+            await asyncio.sleep(interval)
+        charged += 1
         try:
             value = gate.check_write(prop, write.value, context=context)
         except (SafetyRefusal, ValueError) as exc:
             outcome.failed.append(_record(write, error=str(exc)))
             continue
 
-        if written >= burst - 1:
-            # Stay inside the gate's token bucket instead of mass-failing a long restore.
-            await asyncio.sleep(interval)
         try:
             after = await client.set_value(write.path, value)
         except UAError as exc:
             outcome.failed.append(_record(write, error=str(exc)))
             continue
-        written += 1
         if write.property == MONITOR_LEVEL_PROPERTY and _is_number(after):
             gate.note_monitor_event(float(after))
         outcome.applied.append(
@@ -1090,14 +1195,28 @@ async def _apply(
 
 
 async def _context_for(
-    client: UAClient, write: PlannedWrite, *, audio_flowing: bool | None
+    client: UAClient,
+    write: PlannedWrite,
+    *,
+    audio_flowing: bool | None,
+    monitor_paths: Sequence[str],
 ) -> WriteContext:
     reason = f"snapshot restore ({write.phase.name.lower()})"
     if write.property in CLOCK_PROPERTIES:
         return WriteContext(reason=reason, confirm=True, audio_flowing=audio_flowing)
-    if write.property in MONITOR_RELEASE_PROPERTIES and write.value is False:
-        level = await _monitor_level(client, write.path)
-        return WriteContext(reason=reason, monitor_level_db=level)
+    if write.property == DIM_ATTENUATION_PROPERTY:
+        # Lowering the dim attenuation while dim is engaged is an un-dim: the gate needs the
+        # monitor level and the live DimOn of this device's monitor strip to rail it.
+        level, dim_on = await _monitor_rail_state(client, _monitor_strip(write.path, monitor_paths))
+        return WriteContext(
+            reason=reason, is_monitor=True, monitor_level_db=level, dim_on=dim_on
+        )
+    if write.property in MONITOR_RELEASE_PROPERTIES and coerces_to_false(write.value):
+        return WriteContext(
+            reason=reason,
+            is_monitor=_under_any(write.path, monitor_paths),
+            monitor_level_db=await _monitor_level(client, write.path),
+        )
     return WriteContext(reason=reason)
 
 
@@ -1109,6 +1228,34 @@ async def _monitor_level(client: UAClient, path: str) -> float | None:
         if _is_number(value):
             return float(value)
     return None
+
+
+def _monitor_strip(path: str, monitor_paths: Sequence[str]) -> str | None:
+    """The monitor strip belonging to the same device as a device-level property."""
+    device = path.rsplit("/", 1)[0]
+    for candidate in monitor_paths:
+        if candidate.startswith(device + "/"):
+            return candidate
+    return None
+
+
+async def _monitor_rail_state(
+    client: UAClient, strip: str | None
+) -> tuple[float | None, bool | None]:
+    """``(stored level, DimOn)`` of a monitor strip. ``None`` for either means the read failed."""
+    if strip is None:
+        return None, None
+    level: float | None = None
+    with contextlib.suppress(UAError):
+        stored = await client.get_value(f"{strip}/{MONITOR_LEVEL_PROPERTY}")
+        if _is_number(stored):
+            level = float(stored)
+    dim_on: bool | None = None
+    with contextlib.suppress(UAError):
+        value = await client.get_value(f"{strip}/{DIM_ON_PROPERTY}")
+        if isinstance(value, bool):
+            dim_on = value
+    return level, dim_on
 
 
 def _record(

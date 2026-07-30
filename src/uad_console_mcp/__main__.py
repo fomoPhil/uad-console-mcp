@@ -27,7 +27,7 @@ from typing import Any
 from . import __version__
 from .client import DEFAULT_HOST, DEFAULT_PORT, UAClient, UAError
 from .discovery import discover
-from .safety import gate_from_env
+from .safety import DENIED_PROPERTY_SUBSTRINGS, ENV_MODE, gate_from_env
 from .server import CONNECT_HELP, ServerContext, build_server
 
 logger = logging.getLogger("uad_console_mcp")
@@ -35,6 +35,12 @@ logger = logging.getLogger("uad_console_mcp")
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 HOME_PLACEHOLDER = "~"
 DUMP_STDOUT = "-"
+CONFIG_ERROR_EXIT = 2
+
+REDACTED_NAME_SUBSTRINGS: tuple[str, ...] = (*DENIED_PROPERTY_SUBSTRINGS, "serial")
+"""Property names whose VALUE never leaves this machine: the safety denylist plus serials."""
+
+REDACTED_VALUE_KEYS = ("value", "default")
 
 
 def _configure_logging(level: str) -> None:
@@ -89,17 +95,47 @@ def build_parser() -> argparse.ArgumentParser:
 # ------------------------------------------------------------------------------ sanitizing
 
 
-def sanitize(value: Any, home: str | None = None) -> Any:
-    """Replace the home directory with ``~`` in every string, recursively.
+def is_redacted_name(name: Any) -> bool:
+    """True for property names that identify the hardware (serials, firmware, hardware IDs)."""
+    folded = str(name).casefold()
+    return any(needle in folded for needle in REDACTED_NAME_SUBSTRINGS)
 
-    A captured tree carries preset browser paths and volume names; those leak the user's login
-    name straight into a file people paste into issues.
+
+def _redacted_scalar(value: Any) -> Any:
+    """``0`` for numbers, ``"0"`` for everything else. Keeps the shape, drops the identity."""
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return 0
+    return "0"
+
+
+def _redact(item: Any, root: str) -> Any:
+    """Blank the value of one identifying property, keeping its metadata intact."""
+    if isinstance(item, dict) and any(key in item for key in REDACTED_VALUE_KEYS):
+        return {
+            key: _redacted_scalar(sub) if key in REDACTED_VALUE_KEYS else sanitize(sub, root)
+            for key, sub in item.items()
+        }
+    if isinstance(item, dict | list):
+        return sanitize(item, root)
+    return _redacted_scalar(item)
+
+
+def sanitize(value: Any, home: str | None = None) -> Any:
+    """Scrub a captured tree before it is written anywhere, recursively.
+
+    Two things go: the home directory (preset browser paths and volume names leak the user's
+    login name straight into a file people paste into issues), and the VALUE of any property
+    whose name identifies the hardware - serial numbers, firmware versions, hardware IDs. A
+    dumped tree is meant to be shareable as a fixture.
     """
     root = str(Path.home()) if home is None else home
     if isinstance(value, str):
         return value.replace(root, HOME_PLACEHOLDER) if root and root in value else value
     if isinstance(value, dict):
-        return {key: sanitize(item, root) for key, item in value.items()}
+        return {
+            key: _redact(item, root) if is_redacted_name(key) else sanitize(item, root)
+            for key, item in value.items()
+        }
     if isinstance(value, list):
         return [sanitize(item, root) for item in value]
     return value
@@ -279,6 +315,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check and args.dump_tree is not None:
         parser.error("--check and --dump-tree do different things; run them one at a time")
+
+    # Validate the environment before anything connects: an unusable UAD_MCP_MODE or limit is a
+    # configuration error, and a traceback is not how you tell someone they typo'd an env var.
+    try:
+        gate_from_env()
+    except ValueError as exc:
+        print(f"uad-console-mcp: {exc}", file=sys.stderr)
+        print(f"(configuration comes from the environment; see {ENV_MODE})", file=sys.stderr)
+        return CONFIG_ERROR_EXIT
+
     if args.check:
         return asyncio.run(_run_check(args.host, args.port))
     if args.dump_tree is not None:

@@ -71,3 +71,5 @@ Prompts: `setup_vocal_tracking`, `onboard_adat_expander`, `troubleshoot_clock`, 
 - Meters are polled at about 3 Hz. The floor is -77.0 (device silence) or -144.0, and a floor
   reading cannot distinguish silence from a dead digital link.
 - Per-plugin DSP cost is not exposed, only rig totals.
+
+**`enabled` vs `active`:** `enabled` writes the `EnabledByUser` property and is yours to set. `active` reflects the engine's own readonly `Active` state (stereo-link right sides and unused strips report false); it cannot be written, so never try to "fix" it.

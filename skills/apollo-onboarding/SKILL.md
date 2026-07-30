@@ -87,7 +87,7 @@ expander nothing. That single fact explains most dead ADAT links.
 
 Pick one of the two arrangements:
 
-**A. Expander is the master** (simplest with one cable)
+**A. Expander is the master** (works with one cable, but see the trade-off below)
 
 ```
 uad_set_clock(source="ADAT", confirm=true)
@@ -96,7 +96,13 @@ uad_set_clock(source="ADAT", confirm=true)
 The Apollo slaves to the clock arriving on its ADAT IN. The expander stays on its own internal
 clock, and its sample rate must equal the Apollo's. Read the real enum before writing:
 `uad_raw_get(path="/ClockSource")` returns the `values` list this engine accepts (typically
-`Internal`, `Word Clock`, `ADAT`, `S-PDIF`; spellings vary, so use what the engine reports).
+`Internal`, `Word Clock`, `ADAT`, `S/PDIF`; spellings vary, so use what the engine reports).
+
+**Which to pick:** for a permanent studio rig, prefer B. Arrangement A slaves the entire
+interface (monitors, DAW playback, everything) to the expander's clock: power the expander off
+or unplug its cable and the whole system loses lock with dropouts and clicks. A is fine as a
+temporary state while the second cable is in the mail. That is exactly the call made in the
+worked example (references/worked-example-ada8200.md).
 
 **B. Apollo is the master** (`ClockSource: Internal`, needs a second cable)
 
@@ -192,7 +198,10 @@ resolved `{device, index, name}` plus per-property `{verified, before, after, wa
 If the plan needs a clock change, do it here with `uad_set_clock(source=..., confirm=true)`,
 which verifies `ClockLocked` after about 2.5 s and reverts itself if the new source does not lock.
 
-Set preamp basics for mic and instrument channels:
+Set preamp basics for mic and instrument channels. Note this only works on channels whose
+`has_preamp` is true in `uad_list_channels`: ADAT expander channels always report
+`has_preamp: false` because their preamps live in the expander hardware, so gain for those is
+set with the knobs on the expander itself, not through this server:
 
 ```
 uad_set_preamp(target="LEAD VOX", source="Mic", gain_db=20, low_cut=true, pad=false, phase=false)

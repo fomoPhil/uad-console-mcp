@@ -34,7 +34,7 @@ uad_raw_get(path="/ClockSource")
 ```
 
 The reply includes `values`. Use the strings it reports. Spelling of the S/PDIF entry varies
-between engine versions (`S-PDIF` in the captured tree), so never hardcode it.
+between engine versions (this engine reports `S/PDIF`), so never hardcode it.
 
 ## The two valid arrangements for an ADAT expander
 

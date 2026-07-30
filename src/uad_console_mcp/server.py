@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import functools
 import json
 import logging
@@ -636,6 +637,18 @@ async def tool_set_channels(ctx: ServerContext, items: list[dict[str, Any]]) -> 
             )
             continue
         writes, errors = await ctx.write_many(requests)
+        for write in writes:
+            # Keep the cached topology in sync with a verified rename, otherwise the new
+            # name is unresolvable until the rig TTL expires.
+            if write["property"] == "Name" and write["verified"]:
+                try:
+                    index = rig.channels.index(channel)
+                except ValueError:
+                    ctx.invalidate()
+                else:
+                    rig.channels[index] = dataclasses.replace(
+                        channel, name=str(write["after"])
+                    )
         results.append(
             {
                 "target": item.get("target"),

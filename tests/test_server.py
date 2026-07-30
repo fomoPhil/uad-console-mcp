@@ -1382,3 +1382,16 @@ def test_logging_goes_to_stderr(capsys: pytest.CaptureFixture[str]) -> None:
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "must not reach stdout" in captured.err
+
+
+async def test_rename_updates_cached_topology_immediately(mock: MockEngine) -> None:
+    """A verified rename must be resolvable by its new name at once, without waiting
+    out the rig TTL or paying for a re-discovery."""
+    async with context(mock) as ctx:
+        first = await srv.tool_set_channels(ctx, [{"target": "ANALOG 1", "name": "LEAD VOX"}])
+        assert first["ok"] is True
+        walked = ctx.discoveries
+        second = await srv.tool_set_channels(ctx, [{"target": "LEAD VOX", "fader_db": -3.0}])
+        assert second["ok"] is True, second
+        assert second["results"][0]["resolved"]["name"] == "LEAD VOX"
+        assert ctx.discoveries == walked

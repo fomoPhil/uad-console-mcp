@@ -365,13 +365,24 @@ class ServerContext:
         values = await self.poll(list(paths))
         peak = METER_FLOOR_DB
         where: str | None = None
+        read: set[str] = set()
         for path, raw in values.items():
             if not isinstance(raw, int | float) or isinstance(raw, bool):
                 continue
+            read.add(paths[path].path)
             level = float(raw)
             if level > peak:
                 peak = level
                 where = paths[path].name
+        unread = [channel.label() for channel in inputs if channel.path not in read]
+        if unread:
+            # A meter that did not answer is not a silent meter. Fail closed.
+            shown = ", ".join(unread[:8]) + (", ..." if len(unread) > 8 else "")
+            raise UAError(
+                f"Could not read the input meters of {len(unread)} channel(s) ({shown}), so "
+                "there is no proof that audio is silent. Check uad_peek_meters, then retry; "
+                "nothing was changed."
+            )
         return peak > AUDIO_FLOWING_DB, peak, where
 
     # -------------------------------------------------------------------------- writes

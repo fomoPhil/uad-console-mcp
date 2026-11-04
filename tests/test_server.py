@@ -973,6 +973,22 @@ async def test_safe_state_works_with_an_empty_rate_limit_bucket(mock: MockEngine
 # ----------------------------------------------------------------------------------- clock
 
 
+@pytest.mark.parametrize("missing", ["all", "one"])
+async def test_clock_change_fails_closed_when_meters_cannot_be_read(
+    mock: MockEngine, missing: str
+) -> None:
+    """Audit H4: an unread meter is not a silent meter."""
+    for path, node in mock.nodes.items():
+        if "/meters/" in path and (missing == "all" or path.startswith(f"{IN0}/meters/")):
+            node["properties"].pop("MeterLevel", None)
+    async with context(mock) as ctx:
+        result = await srv.tool_set_clock(ctx, "ADAT", confirm=True)
+    assert result["ok"] is False
+    assert "no proof that audio is silent" in result["error"]
+    assert mock.value("/ClockSource") == "Internal"
+    assert mock.set_count() == 0
+
+
 async def test_set_clock_requires_confirmation(mock: MockEngine) -> None:
     async with context(mock) as ctx:
         result = await srv.tool_set_clock(ctx, "ADAT")

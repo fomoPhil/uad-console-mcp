@@ -54,6 +54,7 @@ from .safety import (
     SafetyGate,
     SafetyRefusal,
     WriteContext,
+    canonical_path,
     coerces_to_false,
     gate_from_env,
     property_name,
@@ -2038,7 +2039,21 @@ async def tool_raw_set(ctx: ServerContext, path: str, value: Any) -> dict[str, A
             f"uad_raw_set is only available when UAD_MCP_MODE=full (current mode: "
             f"{ctx.gate.mode!r}). Use the specific tool for this property instead."
         )
-    write = await ctx.write(path, value, context=await _raw_write_context(ctx, path, value))
+    path = canonical_path(path)
+    opens_talkback = path == TALKBACK_ON_PATH and not coerces_to_false(value)
+    try:
+        write = await ctx.write(path, value, context=await _raw_write_context(ctx, path, value))
+    except SafetyRefusal:
+        raise
+    except Exception:
+        if opens_talkback:  # the write may have landed: never leave an open mic untimed
+            ctx.arm_talkback_auto_off(ctx.talkback_auto_off_s)
+        raise
+    if opens_talkback:
+        ctx.arm_talkback_auto_off(ctx.talkback_auto_off_s)
+        write["warnings"].append(f"talkback auto-off armed for {ctx.talkback_auto_off_s:g} s")
+    elif path == TALKBACK_ON_PATH:
+        ctx.cancel_talkback_auto_off()
     return {"writes": [write]}
 
 

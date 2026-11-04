@@ -1534,6 +1534,45 @@ async def test_full_mode_still_rails_the_monitor(mock: MockEngine) -> None:
     assert mock.value(MONITOR_LEVEL) == -22.0
 
 
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (f"{MONITOR}/CRMonitorLevelTapered", 1.0),
+        (f"{MONITOR}/SurroundTrimLevel", 10.0),
+        (f"{MONITOR_MUTE}/value", False),
+        (f"/{MONITOR_MUTE}", False),
+    ],
+)
+async def test_full_mode_has_no_way_around_the_monitor_rail(
+    mock: MockEngine, path: str, value: Any
+) -> None:
+    """Audit H5: other spellings and other level properties must not dodge the rail."""
+    async with context(mock, "full") as ctx:
+        await mock.push(MONITOR_LEVEL, -2.0)
+        await mock.push(MONITOR_MUTE, True)
+        result = await srv.tool_raw_set(ctx, path, value)
+    assert result["ok"] is False, path
+    assert mock.value(f"{MONITOR}/CRMonitorLevelTapered") == pytest.approx(0.3541666567325592)
+    assert mock.value(f"{MONITOR}/SurroundTrimLevel") == 0.0
+    assert mock.value(MONITOR_MUTE) is True
+
+
+async def test_raw_set_refuses_dot_segments(mock: MockEngine) -> None:
+    async with context(mock, "full") as ctx:
+        result = await srv.tool_raw_set(ctx, "/devices/../pluginscenes/0/Name", "x")
+    assert result["ok"] is False and "'..'" in result["error"]
+    assert mock.set_count() == 0
+
+
+async def test_raw_set_talkback_on_arms_the_auto_off_timer(mock: MockEngine) -> None:
+    """Audit H5: raw_set must not be a way to open talkback with no timer behind it."""
+    async with context(mock, "full", talkback_auto_off_s=0.05) as ctx:
+        result = await srv.tool_raw_set(ctx, "/TalkbackOn", True)
+        assert result["ok"] is True
+        assert "auto-off armed" in " ".join(result["writes"][0]["warnings"])
+        assert await wait_until(lambda: mock.value("/TalkbackOn") is False)
+
+
 @pytest.mark.parametrize("prop", ["Mute", "DimOn"])
 async def test_raw_set_rails_a_monitor_release_against_the_stored_level(
     mock: MockEngine, prop: str

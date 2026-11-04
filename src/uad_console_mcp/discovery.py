@@ -328,6 +328,11 @@ class Rig:
         text = device.strip()
         if not text:
             raise ValueError("device selector must not be empty")
+        if _is_index_text(text):
+            # "2" is device 2, never "the device whose name contains a 2" (Apollo x8 Gen 2).
+            index = int(text)
+            self._require_device(index)
+            return {index}
         wanted = _fold(text)
         haystack = [(info, (_fold(info.name), _fold(info.type_id))) for info in self.devices]
         for predicate in (
@@ -338,10 +343,6 @@ class Rig:
             hits = {info.index for info, fields in haystack if any(map(predicate, fields))}
             if hits:
                 return hits
-        if _is_index_text(text):
-            index = int(text)
-            self._require_device(index)
-            return {index}
         raise TargetNotFoundError(
             device,
             "device",

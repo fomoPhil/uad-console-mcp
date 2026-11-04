@@ -182,6 +182,38 @@ async def test_get_status_reports_every_unit_of_a_cascade(
     assert all(device["online"] for device in result["devices"])
 
 
+def same_name_cascade(base: Tree) -> Tree:
+    """A real cascade: both units name their strips identically (the derived one prefixes B)."""
+    tree = cascade_fixture(base)
+    for path, node in tree["nodes"].items():
+        name = node["properties"].get("Name")
+        if path.startswith("/devices/1/inputs/") and isinstance(name, dict):
+            name["value"] = name["value"].removeprefix("B ")
+    return tree
+
+
+async def test_watch_meters_keeps_same_named_cascade_channels_apart(
+    mock_factory: Any, base_fixture: Tree
+) -> None:
+    """Audit M1: two units' 'ANALOG 1' must not merge into one peak."""
+    engine = await mock_factory(same_name_cascade(base_fixture))
+    engine.nodes["/devices/1/inputs/0/meters/0"]["properties"]["MeterLevel"]["value"] = -10.0
+    async with context(engine) as ctx:
+        result = await srv.tool_watch_meters(ctx, duration_s=0.1, threshold_db=-20)
+    assert result["triggered_channels"] == ["ANALOG 1 (device 1)"]
+    assert result["peaks_db"]["ANALOG 1 (device 1)"] == -10.0
+    assert result["peaks_db"]["ANALOG 1 (device 0)"] < -70
+
+
+async def test_a_numeric_device_string_is_an_index(mock: MockEngine) -> None:
+    """Audit M2: device='2' must not match 'Apollo x8 Gen 2' by name."""
+    async with context(mock) as ctx:
+        rig = await ctx.rig()
+        assert rig.resolve("ANALOG 1", device="0").device == 0
+        with pytest.raises(srv.TargetNotFoundError):
+            rig.resolve("ANALOG 1", device="2")
+
+
 async def test_list_channels_golden_shape(mock: MockEngine) -> None:
     async with context(mock) as ctx:
         result = await srv.tool_list_channels(ctx)

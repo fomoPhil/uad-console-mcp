@@ -1807,6 +1807,16 @@ async def tool_watch_meters(
         for channel in channels
         for meter in (0, 1)
     }
+    names = [channel.name for channel in channels]
+    # Cascaded Apollos repeat strip names ("ANALOG 1" on every unit): say which device.
+    labels = {
+        channel.path: (
+            f"{channel.name} (device {channel.device})"
+            if names.count(channel.name) > 1
+            else channel.name
+        )
+        for channel in channels
+    }
     peaks: dict[str, float] = {}
     triggered: list[str] = []
     loop = asyncio.get_running_loop()
@@ -1820,11 +1830,11 @@ async def tool_watch_meters(
             level = _number(raw)
             if level is None:
                 continue
-            channel = level_paths[path]
-            if level > peaks.get(channel.name, float("-inf")):
-                peaks[channel.name] = level
-            if level > threshold_db and channel.name not in triggered:
-                triggered.append(channel.name)
+            label = labels[level_paths[path].path]
+            if level > peaks.get(label, float("-inf")):
+                peaks[label] = level
+            if level > threshold_db and label not in triggered:
+                triggered.append(label)
         if triggered:
             break
         remaining = deadline - loop.time()

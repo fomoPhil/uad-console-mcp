@@ -456,6 +456,35 @@ async def test_no_sequence_of_monitor_calls_can_pass_the_ceiling(mock: MockEngin
             assert level <= ceiling + 1e-9, f"step {step}: {level} exceeded the {ceiling} ceiling"
 
 
+async def test_concurrent_monitor_calls_cannot_beat_the_window_budget(
+    mock: MockEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Audit H3: MCP runs tool calls concurrently; parallel raises must share one budget.
+
+    A slow read-back holds each call between its write and its budget record, and the next call
+    starts in that gap, which is the interleaving that used to let every call see an empty window.
+    """
+    gate = SafetyGate("safe", max_monitor_db=0.0, writes_per_second=500.0, write_burst=500)
+    await mock.push(MONITOR_LEVEL, -40.0)
+    async with context(mock, gate=gate) as ctx:
+        await srv.tool_list_channels(ctx)  # warm the topology cache
+        real_set = ctx.client.set_value
+
+        async def slow_verify(path: str, value: Any) -> Any:
+            applied = await real_set(path, value)
+            await asyncio.sleep(0.05)
+            return applied
+
+        monkeypatch.setattr(ctx.client, "set_value", slow_verify)
+
+        async def raise_by_six(delay: float) -> None:
+            await asyncio.sleep(delay)
+            await srv.tool_set_monitor(ctx, level_db=0.0)
+
+        await asyncio.gather(*(raise_by_six(0.01 * i) for i in range(4)))
+    assert mock.value(MONITOR_LEVEL) <= -40.0 + gate.describe()["monitor_window_db"] + 1e-9
+
+
 async def test_the_server_never_newly_exposes_an_above_ceiling_level(mock: MockEngine) -> None:
     """The real property: no call may RAISE what the room hears past the ceiling.
 

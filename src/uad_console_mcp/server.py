@@ -201,6 +201,17 @@ def tool(fn: ToolFn) -> ToolFn:
     return wrapper
 
 
+def monitor_serialized(fn: ToolFn) -> ToolFn:
+    """Run a tool that can reach the monitor rail under :attr:`ServerContext.monitor_lock`."""
+
+    @functools.wraps(fn)
+    async def wrapper(ctx: ServerContext, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        async with ctx.monitor_lock:
+            return await fn(ctx, *args, **kwargs)
+
+    return wrapper
+
+
 # ---------------------------------------------------------------------------------- context
 
 
@@ -239,6 +250,9 @@ class ServerContext:
         self._catalog: list[dict[str, Any]] | None = None
         self._catalog_at = 0.0
         self._talkback_task: asyncio.Task[None] | None = None
+        #: Serializes every tool that can raise the monitor level. The rolling budget is
+        #: read-check-write-record, and MCP runs tool calls concurrently.
+        self.monitor_lock = asyncio.Lock()
         client.on_reconnect(self._on_reconnect)
 
     # ------------------------------------------------------------------- topology cache
@@ -713,6 +727,7 @@ async def tool_list_channels(
 
 
 @tool
+@monitor_serialized
 async def tool_set_channels(ctx: ServerContext, items: list[dict[str, Any]]) -> dict[str, Any]:
     """Batch channel writes: fader, pan, mute, solo, rename, hide, per item."""
     if not items:
@@ -956,6 +971,7 @@ async def tool_set_sends(ctx: ServerContext, items: list[dict[str, Any]]) -> dic
 
 
 @tool
+@monitor_serialized
 async def tool_set_monitor(
     ctx: ServerContext,
     device: int | None = None,
@@ -1884,18 +1900,19 @@ async def tool_snapshot(
     flowing: bool | None = None
     if include_clock:
         flowing, _, _ = await ctx.audio_flowing()
-    result = await snapshot.restore(
-        ctx.client,
-        rig,
-        doc,
-        gate=ctx.gate,
-        dry_run=dry_run,
-        include_clock=include_clock,
-        include_monitor=include_monitor,
-        allow_cross_model=allow_cross_model,
-        audio_flowing=flowing,
-        store=store,
-    )
+    async with ctx.monitor_lock:
+        result = await snapshot.restore(
+            ctx.client,
+            rig,
+            doc,
+            gate=ctx.gate,
+            dry_run=dry_run,
+            include_clock=include_clock,
+            include_monitor=include_monitor,
+            allow_cross_model=allow_cross_model,
+            audio_flowing=flowing,
+            store=store,
+        )
     return {"action": "restore", "name": name, **result}
 
 
@@ -2002,6 +2019,7 @@ async def _raw_dim_attenuation_context(
 
 
 @tool
+@monitor_serialized
 async def tool_raw_set(ctx: ServerContext, path: str, value: Any) -> dict[str, Any]:
     """Write any property directly. Registered only when UAD_MCP_MODE=full."""
     if ctx.gate.mode != "full":

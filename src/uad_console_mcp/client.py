@@ -292,7 +292,9 @@ class _Channel:
             try:
                 msg = json.loads(raw.decode("utf-8"))
             except (UnicodeDecodeError, ValueError) as exc:
-                raise UAError(f"malformed frame from engine ({len(raw)} bytes): {exc}") from exc
+                # NUL framing resynchronizes by itself: drop this frame, keep the socket.
+                logger.warning("dropping malformed frame (%d bytes): %s", len(raw), exc)
+                continue
             if isinstance(msg, dict) and "path" in msg:
                 messages.append(msg)
             else:

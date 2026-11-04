@@ -24,7 +24,7 @@ parameters, and do not rename them.
 | `uad_set_preamp` | `target`, `device?`, `gain_db?`, `pad?`, `low_cut?`, `phase?`, `hi_z?`, `source?` (`"Mic"` or `"Line"`), `phantom_48v?`, `confirm_condenser_mic` (default false) |
 | `uad_set_sends` | `items`: list of `{target, send, device?, kind?, level_db?, pan?, bypass?}`; `send` is `"aux1"`, `"aux2"`, `"cue1"`..`"cue4"` or an index. `level_db` is -144 to +12 dB, where -144.0 means the send is off. Read the current value with `uad_raw_get(path=".../sends/N")`; a `cueN` above the device's `cue_buses` count verifies but returns a phantom-bus warning |
 | `uad_set_monitor` | `device?`, `level_db?`, `dim?`, `mute?`, `mono?`, `alt_speaker?`, `dim_attenuation_db?` |
-| `uad_talkback` | `on?`, `level?`, `auto_off_s?` (default 30 s) |
+| `uad_talkback` | `on?`, `level?`, `auto_off_s?` (default 30 s, must be above 0) |
 | `uad_safe_state` | none |
 | `uad_set_clock` | `source`, `confirm` (must be true) |
 | `uad_set_sample_rate` | `rate`, `confirm` (must be true) |

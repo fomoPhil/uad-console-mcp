@@ -151,7 +151,10 @@ back in `failed` with reasons. Clock, rate and monitor need `include_clock` / `i
 | `Refused to switch 48V phantom power on ...` | No condenser confirmation | Ask what mic it is. Ribbon means never |
 | `Refused write to /ClockSource: changing ClockSource re-locks the whole audio chain` | No `confirm` | Warn the user, then retry with `confirm=true` |
 | `Refused write ...: audio is flowing (an input meter is above -60 dB)` | Signal present | Ask for playback and recording to stop, verify with `uad_peek_meters`, then retry |
-| `Refused write ...: write rate limit reached` | Token bucket empty | Wait the stated seconds. Batch tools (`uad_set_channels`, `uad_set_sends`) instead of many single calls |
+| `Refused write ...: write rate limit reached` | Token bucket empty | Wait the stated seconds. Batch tools (`uad_set_channels`, `uad_set_sends`) instead of many single calls. Mutes and talkback-off are never limited, so `uad_safe_state` still works |
+| `Could not read the input meters of N channel(s) ...` | The clock or rate gate could not prove silence | Run `uad_peek_meters`, report which meters do not answer, and stop. Nothing was changed |
+| `unknown key(s) 'X'; nothing was written for this item` | A batch item had a key the tool does not know | Fix the key from the allowed list in the message and resend that item only |
+| `The engine reports X after writing /ClockSource` (or `/SampleRate`) | The engine kept or changed the value | A failure, not a retry cue. Read it with `uad_raw_get` and report it |
 | `'X' matches N input targets: ...` (`AmbiguousTargetError`) | Several channels matched | Pick one candidate from the list by exact name, or pass `device` and/or the index. Never guess |
 | `No input matches 'X'. Closest input names: ...` | No match | Call `uad_list_channels` and use a real name. It may also be a just-renamed channel: use its index |
 | `parameter nodes did not appear at ... within 5s` | Plugin loaded, parameters not materialized | Wait, call `uad_get_plugin_params` again. Parameter writes were skipped, not lost silently |

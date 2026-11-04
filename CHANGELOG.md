@@ -65,12 +65,30 @@ First public MCP server for UAD Console / the UA Mixer Engine.
 - **Documentation**: `README.md`, `AGENTS.md` (rules and canonical flows for LLM callers),
   `docs/PROTOCOL.md` (wire protocol cheatsheet), `docs/RECIPES.md`, and `docs/SPEC.md` (module
   contracts).
-- **500 tests** against `tests/mock_engine.py`, covering framing edge cases (split frames,
+- **543 tests** against `tests/mock_engine.py`, covering framing edge cases (split frames,
   batched frames, meter noise, abrupt disconnects, unanswered paths), reply interleaving,
   serialized writes under concurrency, reconnect and rediscovery, `readonly` mode reaching the
   wire zero times, the monitor rail as a property test, snapshot round-trips on a cascade fixture,
   cross-model restore refusal, and a randomized soak. Plus a 7-test `live` smoke suite that has
   been run against a real Apollo x8 Gen 2; it needs real hardware and is excluded by default.
+
+### Fixed (November 2026 audit, see `docs/audit-2026-11.md`)
+
+- Talkback that this server opened is switched off when the MCP session ends. Before, the auto-off
+  timer died with the event loop and the mic stayed open.
+- `uad_safe_state` is never rate-limited: mutes and talkback-off skip the token bucket.
+- Monitor writes are serialized, so parallel calls can no longer beat the +10 dB / 30 s budget.
+- Clock and sample-rate changes are refused when any input meter cannot be read.
+- `full` mode: `CRMonitorLevelTapered` and `SurroundTrimLevel` are refused, paths are
+  canonicalized (`//`, trailing `/value`, `..`), denylist matching ignores case, and
+  `uad_raw_set` on `/TalkbackOn` arms the auto-off timer.
+- `uad_watch_meters` labels same-named cascade channels with their device, and a numeric `device`
+  string is read as an index.
+- Failed tools return `isError: true`; read-only tools carry `readOnlyHint`; `kind` and `action`
+  are enums in the schema.
+- Batch items with unknown keys fail instead of being half-applied; an unverified clock or
+  sample-rate write is `ok: false`; `auto_off_s` must be above 0.
+- A malformed engine frame is dropped instead of the whole socket. `mcp` is pinned below 3.
 
 ### Verified scope
 

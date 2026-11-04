@@ -2417,9 +2417,10 @@ def build_server(ctx: ServerContext) -> Any:
         name="uad_set_monitor",
         description=(
             "Set the control-room monitor: level_db (hard-railed), dim, mute, mono fold, alt "
-            "speaker selection, dim attenuation. Unmuting, un-dimming and LOWERING "
-            "dim_attenuation_db are all treated as level events and can be refused; level_db is "
-            "written first and the release is railed against the level the engine reports back.\n"
+            "speaker selection, dim attenuation. A level_db above the ceiling is refused, not "
+            "clamped. Unmuting, un-dimming and LOWERING dim_attenuation_db are all treated as "
+            "level events and can be refused; level_db is written first and the release is railed "
+            "against the level the engine reports back.\n"
             "Use when: changing what the control room hears, or recovering after uad_safe_state.\n"
             "Not for: headphone level - the protocol cannot set it; see uad://limitations."
         ),
@@ -2448,7 +2449,8 @@ def build_server(ctx: ServerContext) -> Any:
         name="uad_talkback",
         description=(
             "Turn talkback on or off and set its level, with an auto-off timer (default 30 s) so "
-            "an open talkback mic cannot be forgotten. Calling it again replaces the timer.\n"
+            "an open talkback mic cannot be forgotten. auto_off_s must be above 0. Calling it "
+            "again replaces the timer.\n"
             "Use when: the engineer needs to speak to the live room.\n"
             "Not for: routing the talkback mic or choosing which mic it is - that is set in "
             "Console."

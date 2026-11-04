@@ -2072,6 +2072,29 @@ async def test_a_registered_tool_can_be_called_through_mcp(mock: MockEngine) -> 
     assert payload.get("total") == 2 or "AUX 1" in str(result)
 
 
+async def test_a_failed_tool_sets_is_error_and_a_good_one_does_not(mock: MockEngine) -> None:
+    """Audit M3: clients and models key on isError, so a refusal must not read as success."""
+    async with context(mock) as ctx:
+        server = srv.build_server(ctx)
+        good = await server.call_tool("uad_list_channels", {"kind": "aux"})
+        bad = await server.call_tool("uad_set_preamp", {"target": "UG 1", "gain_db": 10})
+    assert good.is_error is False
+    assert good.structured_content["total"] == 2
+    assert bad.is_error is True
+    assert "has no preamp" in bad.structured_content["error"]
+
+
+async def test_read_tools_are_hinted_read_only_and_kind_is_an_enum(mock: MockEngine) -> None:
+    """Audit M7: clients can auto-approve reads, and models see the allowed kinds."""
+    async with context(mock, "full") as ctx:
+        tools = {tool.name: tool for tool in await srv.build_server(ctx).list_tools()}
+    hinted = {name for name, tool in tools.items() if tool.annotations is not None}
+    assert hinted == srv.READ_ONLY_TOOLS
+    assert all(tools[name].annotations.read_only_hint for name in hinted)
+    kind = tools["uad_list_channels"].input_schema["properties"]["kind"]
+    assert kind["enum"] == ["input", "aux", "output", "all"]
+
+
 async def test_the_clock_prompt_encodes_the_real_diagnosis(mock: MockEngine) -> None:
     """SPEC §4.5: the clock prompt must carry the facts, not just a list of tools."""
     body = srv.TROUBLESHOOT_CLOCK

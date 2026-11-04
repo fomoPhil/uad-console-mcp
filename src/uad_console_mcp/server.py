@@ -28,7 +28,7 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
-from typing import Any
+from typing import Any, Literal
 
 from . import __version__, snapshot
 from .client import (
@@ -2235,21 +2235,32 @@ unmute everything at once; change the clock source or sample rate; or engage 48V
 # --------------------------------------------------------------------------- registration
 
 
+READ_ONLY_TOOLS = frozenset(
+    {
+        "uad_get_status",
+        "uad_list_channels",
+        "uad_list_plugins",
+        "uad_get_inserts",
+        "uad_get_plugin_params",
+        "uad_peek_meters",
+        "uad_watch_meters",
+        "uad_raw_get",
+    }
+)
+
+ChannelKindArg = Literal["input", "aux", "output"]
+
+
 def _server_class() -> Any:
-    """The decorator-style MCP server class, whatever the installed ``mcp`` calls it.
+    """The decorator-style MCP server class (``MCPServer``; ``pyproject.toml`` pins mcp 2.x).
 
     SPEC §4.5 says ``FastMCP``; mcp 2.x renamed the identical decorator API to ``MCPServer``.
     Imported lazily so the tool functions above stay importable (and unit-testable) even if the
     ``mcp`` package is not installed at all.
     """
-    try:
-        from mcp.server import MCPServer
+    from mcp.server import MCPServer
 
-        return MCPServer
-    except ImportError:  # pragma: no cover - mcp < 2.0
-        from mcp.server.fastmcp import FastMCP
-
-        return FastMCP
+    return MCPServer
 
 
 def build_server(ctx: ServerContext) -> Any:
@@ -2271,15 +2282,35 @@ def build_server(ctx: ServerContext) -> Any:
         ),
     )
 
+    from mcp.types import CallToolResult, TextContent, ToolAnnotations
+
     registered: list[str] = []
 
     def register(**kwargs: Any) -> Callable[[ToolFn], ToolFn]:
-        """Register a tool and remember its name, so the count can be logged and asserted."""
+        """Register a tool and remember its name, so the count can be logged and asserted.
+
+        Read-only tools carry ``readOnlyHint`` so clients can tell them from writes, and a tool
+        that failed outright comes back with ``isError: true`` as well as its ``error`` sentence.
+        """
+        name = str(kwargs["name"])
+        if name in READ_ONLY_TOOLS:
+            kwargs["annotations"] = ToolAnnotations(read_only_hint=True)
         decorate = server.tool(**kwargs)
 
         def wrap(fn: ToolFn) -> ToolFn:
-            registered.append(str(kwargs["name"]))
-            return decorate(fn)
+            @functools.wraps(fn)
+            async def call(*args: Any, **inner: Any) -> Any:
+                result = await fn(*args, **inner)
+                if result.get("ok") is False and "error" in result:
+                    return CallToolResult(
+                        content=[TextContent(type="text", text=json.dumps(result, default=str))],
+                        structured_content=result,
+                        is_error=True,
+                    )
+                return result
+
+            registered.append(name)
+            return decorate(call)
 
         return wrap
 
@@ -2307,7 +2338,9 @@ def build_server(ctx: ServerContext) -> Any:
         ),
     )
     async def uad_list_channels(
-        kind: str = "input", device: int | None = None, include_hidden: bool = True
+        kind: Literal["input", "aux", "output", "all"] = "input",
+        device: int | None = None,
+        include_hidden: bool = True,
     ) -> dict[str, Any]:
         return await tool_list_channels(
             ctx, kind=kind, device=device, include_hidden=include_hidden
@@ -2502,7 +2535,7 @@ def build_server(ctx: ServerContext) -> Any:
     async def uad_get_inserts(
         target: str | int | None = None,
         device: int | None = None,
-        kind: str = "input",
+        kind: ChannelKindArg = "input",
         loaded_only: bool = True,
     ) -> dict[str, Any]:
         return await tool_get_inserts(
@@ -2610,7 +2643,7 @@ def build_server(ctx: ServerContext) -> Any:
     )
     async def uad_peek_meters(
         targets: list[str] | None = None,
-        kind: str = "input",
+        kind: ChannelKindArg = "input",
         device: int | None = None,
         above_db: float | None = None,
     ) -> dict[str, Any]:
@@ -2633,7 +2666,7 @@ def build_server(ctx: ServerContext) -> Any:
         duration_s: float = 5.0,
         threshold_db: float = AUDIO_FLOWING_DB,
         interval_s: float = DEFAULT_WATCH_INTERVAL_S,
-        kind: str = "input",
+        kind: ChannelKindArg = "input",
         device: int | None = None,
     ) -> dict[str, Any]:
         return await tool_watch_meters(
@@ -2660,7 +2693,7 @@ def build_server(ctx: ServerContext) -> Any:
         ),
     )
     async def uad_snapshot(
-        action: str = "list",
+        action: Literal["save", "list", "diff", "restore"] = "list",
         name: str | None = None,
         dry_run: bool = True,
         ignore: list[str] | None = None,

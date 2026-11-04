@@ -929,6 +929,18 @@ async def test_safe_state_mutes_monitors_and_kills_talkback(mock: MockEngine) ->
     assert "uad_set_monitor(mute=false)" in result["next"]
 
 
+async def test_safe_state_works_with_an_empty_rate_limit_bucket(mock: MockEngine) -> None:
+    """Audit H2: a runaway agent empties the bucket; the panic button must still land."""
+    gate = SafetyGate("safe", writes_per_second=0.01, write_burst=2)
+    async with context(mock, gate=gate) as ctx:
+        await mock.push("/TalkbackOn", True)
+        await srv.tool_set_channels(ctx, [{"target": i, "fader_db": -1} for i in range(3)])
+        result = await srv.tool_safe_state(ctx)
+    assert result["ok"] is True, result.get("errors")
+    assert mock.value(f"{MONITOR}/Mute") is True
+    assert mock.value("/TalkbackOn") is False
+
+
 # ----------------------------------------------------------------------------------- clock
 
 

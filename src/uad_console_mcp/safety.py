@@ -313,6 +313,13 @@ def coerces_to_false(value: Any) -> bool:
     return isinstance(value, str) and value.strip().casefold() in _FALSY
 
 
+def _only_quieter(name: str, value: Any) -> bool:
+    """``Mute`` switched on, or ``TalkbackOn`` switched off: writes that cannot add level."""
+    if name == "Mute":
+        return value is True or (isinstance(value, str) and value.strip().casefold() in _TRUTHY)
+    return name == "TalkbackOn" and coerces_to_false(value)
+
+
 def _refuse(reason: str, remedy: str) -> NoReturn:
     message = f"{reason} {remedy}"
     logger.warning("refused: %s", message)
@@ -482,8 +489,12 @@ class SafetyGate:
             _refuse(f"Refused write to {path}{because}: {denial}", _NO_UNBLOCK)
 
         # Everything below this line costs a token whether it is allowed or refused: the caller
-        # already spent a property read to get here, so refusals must not be free.
-        self._consume_token(path)
+        # already spent a property read to get here, so refusals must not be free. The one
+        # exception is a write that can only make things quieter (a mute, talkback off): the
+        # bucket is empty exactly when an agent has run away, which is when the panic button
+        # must still work.
+        if not _only_quieter(name, new_value):
+            self._consume_token(path)
 
         if getattr(prop, "readonly", False) and not self._allow_readonly_writes:
             _refuse(

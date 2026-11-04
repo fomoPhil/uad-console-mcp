@@ -683,6 +683,23 @@ def test_refused_writes_spend_a_token_too() -> None:
     assert "not in the safe-mode allowlist" in str(refilled.value)
 
 
+def test_quieting_writes_are_never_rate_limited() -> None:
+    """Audit H2: an empty bucket is exactly when the panic button has to work."""
+    barrier = gate("safe", write_burst=1, clock=FakeClock())
+    barrier.check_write(fader(), -6.0, context="spends the only token")
+    with pytest.raises(SafetyRefusal, match="rate limit"):
+        barrier.check_write(fader(), -6.0, context="empty")
+    mute = prop(f"{INPUT}/Mute", "bool", False)
+    talkback = prop("/TalkbackOn", "bool", True)
+    for _ in range(20):
+        assert barrier.check_write(mute, True, context="panic") is True
+        assert barrier.check_write(talkback, False, context="panic") is False
+    with pytest.raises(SafetyRefusal, match="rate limit"):
+        barrier.check_write(mute, False, context="an unmute is not exempt")
+    with pytest.raises(SafetyRefusal, match="rate limit"):
+        barrier.check_write(talkback, True, context="talkback on is not exempt")
+
+
 def test_readonly_mode_never_degrades_into_a_rate_limit_message() -> None:
     """No wait unblocks readonly mode, so never answer a readonly write with 'retry in 0.1 s'."""
     barrier = gate("readonly", write_burst=1, clock=FakeClock())

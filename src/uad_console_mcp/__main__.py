@@ -24,6 +24,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import anyio
+
 from . import __version__
 from .client import DEFAULT_HOST, DEFAULT_PORT, UAClient, UAError
 from .discovery import discover
@@ -292,17 +294,20 @@ def serve(host: str, port: int) -> int:
         "serving MCP on stdio; engine %s:%s, safety mode %s", host, port, ctx.gate.mode
     )
     try:
-        server.run("stdio")
+        asyncio.run(_serve(server, ctx, client))
     except KeyboardInterrupt:  # pragma: no cover - interactive only
         logger.info("interrupted; shutting down")
-    finally:
-        asyncio.run(_shutdown(ctx, client))
     return 0
 
 
-async def _shutdown(ctx: ServerContext, client: UAClient) -> None:
-    await ctx.aclose()
-    await client.aclose()
+async def _serve(server: Any, ctx: ServerContext, client: UAClient) -> None:
+    """Serve, then clean up in the SAME event loop, so shutdown can still reach the engine."""
+    try:
+        await server.run_stdio_async()
+    finally:
+        with anyio.CancelScope(shield=True):
+            await ctx.shutdown()
+            await client.aclose()
 
 
 # ------------------------------------------------------------------------------------ main

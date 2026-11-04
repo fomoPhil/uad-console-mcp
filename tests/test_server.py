@@ -750,6 +750,37 @@ async def test_repeat_talkback_calls_replace_the_timer(mock: MockEngine) -> None
         assert mock.value("/TalkbackOn") is False
 
 
+async def test_shutdown_closes_talkback_this_server_opened(mock: MockEngine) -> None:
+    """Audit H1: a client that disconnects inside the auto-off window must not leave a live mic."""
+    async with context(mock) as ctx:
+        await srv.tool_talkback(ctx, on=True, auto_off_s=30.0)
+        assert mock.value("/TalkbackOn") is True
+        await ctx.shutdown()
+        assert mock.value("/TalkbackOn") is False
+        assert ctx.talkback_timer_running is False
+
+
+async def test_shutdown_leaves_talkback_alone_without_a_timer(mock: MockEngine) -> None:
+    """Talkback opened from Console (no timer of ours) is not this server's to close."""
+    async with context(mock) as ctx:
+        await mock.push("/TalkbackOn", True)
+        await ctx.shutdown()
+        assert mock.value("/TalkbackOn") is True
+        assert mock.set_count() == 0
+
+
+async def test_serve_runs_shutdown_in_the_same_loop(mock: MockEngine) -> None:
+    """Audit H1: cleanup happens before the serving loop ends, so the write still lands."""
+    async with context(mock) as ctx:
+
+        class FakeServer:
+            async def run_stdio_async(self) -> None:
+                await srv.tool_talkback(ctx, on=True, auto_off_s=30.0)
+
+        await cli._serve(FakeServer(), ctx, ctx.client)
+    assert mock.value("/TalkbackOn") is False
+
+
 async def test_talkback_arms_the_timer_even_when_the_level_write_fails(
     mock: MockEngine, monkeypatch: pytest.MonkeyPatch
 ) -> None:

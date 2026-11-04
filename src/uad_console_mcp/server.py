@@ -294,6 +294,25 @@ class ServerContext:
         logger.info("control socket reconnected: dropping the topology cache")
         self.invalidate()
 
+    async def shutdown(self, timeout_s: float = 3.0) -> None:
+        """End of session: if this server's talkback timer is still pending, close talkback now.
+
+        The timer dies with the event loop, so without this an MCP client that disconnects within
+        the auto-off window leaves a live talkback mic open with nothing left to close it.
+        """
+        if self.talkback_timer_running:
+            self.cancel_talkback_auto_off()
+            try:
+                await asyncio.wait_for(
+                    self.write(
+                        TALKBACK_ON_PATH, False, context=WriteContext(reason="server shutdown")
+                    ),
+                    timeout_s,
+                )
+            except Exception as exc:
+                logger.error("could not turn talkback off at shutdown: %s", exc)
+        await self.aclose()
+
     async def aclose(self) -> None:
         """Cancel the talkback timer. The client is owned by whoever built it."""
         self.cancel_talkback_auto_off()

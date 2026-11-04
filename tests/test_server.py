@@ -429,6 +429,24 @@ async def test_set_sends_requires_target_and_send(mock: MockEngine) -> None:
     assert "needs a 'target' and a 'send'" in result["results"][0]["error"]
 
 
+async def test_batch_items_with_unknown_keys_write_nothing(mock: MockEngine) -> None:
+    """Audit M4: a typo like 'volume' must fail the item, not vanish behind a rename."""
+    async with context(mock) as ctx:
+        channels = await srv.tool_set_channels(
+            ctx, [{"target": "ANALOG 1", "name": "KICK", "volume": -6}]
+        )
+        sends = await srv.tool_set_sends(
+            ctx, [{"target": "ANALOG 1", "send": "cue1", "level": -6}]
+        )
+        empty = await srv.tool_set_channels(ctx, [])
+    assert channels["ok"] is False
+    assert "'volume'" in channels["results"][0]["error"]
+    assert "fader_db" in channels["results"][0]["error"]
+    assert sends["ok"] is False and "'level'" in sends["results"][0]["error"]
+    assert empty["ok"] is False and "items was empty" in empty["error"]
+    assert mock.set_count() == 0
+
+
 # --------------------------------------------------------------------------------- monitor
 
 
@@ -811,6 +829,16 @@ async def test_repeat_talkback_calls_replace_the_timer(mock: MockEngine) -> None
         assert mock.value("/TalkbackOn") is False
 
 
+@pytest.mark.parametrize("auto_off_s", [0, -1.0])
+async def test_talkback_timer_cannot_be_switched_off(mock: MockEngine, auto_off_s: float) -> None:
+    """Audit M6: 'cannot be forgotten' means there is always a timer."""
+    async with context(mock) as ctx:
+        result = await srv.tool_talkback(ctx, on=True, auto_off_s=auto_off_s)
+    assert result["ok"] is False
+    assert "auto_off_s must be above 0" in result["error"]
+    assert mock.value("/TalkbackOn") is False
+
+
 async def test_shutdown_closes_talkback_this_server_opened(mock: MockEngine) -> None:
     """Audit H1: a client that disconnects inside the auto-off window must not leave a live mic."""
     async with context(mock) as ctx:
@@ -1155,6 +1183,25 @@ async def test_set_sample_rate_rejects_a_rate_the_engine_does_not_offer(mock: Mo
     assert result["ok"] is False
     assert "not one of its allowed values" in result["error"]
     assert mock.value("/SampleRate") == 48000
+
+
+@pytest.mark.parametrize("tool_name", ["rate", "clock"])
+async def test_an_unverified_transport_write_is_not_ok(
+    mock: MockEngine, monkeypatch: pytest.MonkeyPatch, tool_name: str
+) -> None:
+    """Audit M5: the engine keeping its old value is a failure, whatever ClockLocked says."""
+    async with context(mock) as ctx:
+
+        async def ignored(path: str, value: Any) -> Any:
+            return mock.value(path)
+
+        monkeypatch.setattr(ctx.client, "set_value", ignored)
+        if tool_name == "rate":
+            result = await srv.tool_set_sample_rate(ctx, 96000, confirm=True)
+        else:
+            result = await srv.tool_set_clock(ctx, "ADAT", confirm=True)
+    assert result["ok"] is False
+    assert "do not retry" in result["error"]
 
 
 # --------------------------------------------------------------------------------- plugins

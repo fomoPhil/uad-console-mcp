@@ -580,6 +580,25 @@ def _item_error(item: Mapping[str, Any], message: str) -> dict[str, Any]:
     return {"target": item.get("target"), "ok": False, "error": message}
 
 
+def _unverified(write: Mapping[str, Any], path: str) -> str:
+    return (
+        f"The engine reports {write['after']!r} after writing {path}, not the requested value. "
+        f"Treat this as a failure: read it with uad_raw_get(path={path!r}) and do not retry."
+    )
+
+
+def _unknown_keys(item: Mapping[str, Any], allowed: Iterable[str]) -> str | None:
+    """An error sentence for keys a batch item does not understand, so a typo is not a no-op."""
+    known = set(allowed)
+    extra = sorted(str(key) for key in item if key not in known)
+    if not extra:
+        return None
+    return (
+        f"unknown key(s) {', '.join(repr(key) for key in extra)}; nothing was written for this "
+        f"item. Allowed keys: {', '.join(sorted(known))}."
+    )
+
+
 async def _monitor_rail_state(
     ctx: ServerContext, strip_path: str
 ) -> tuple[float | None, bool | None]:
@@ -608,6 +627,9 @@ _CHANNEL_FIELDS: tuple[tuple[str, str], ...] = (
     ("enabled", "EnabledByUser"),
 )
 """Tool-facing name -> engine property, in the order writes are applied."""
+
+_CHANNEL_ITEM_KEYS = ("target", "device", "kind", *(key for key, _ in _CHANNEL_FIELDS))
+_SEND_ITEM_KEYS = ("target", "send", "device", "kind", "level_db", "pan", "bypass")
 
 
 # ------------------------------------------------------------------------------- status
@@ -743,7 +765,7 @@ async def tool_list_channels(
 async def tool_set_channels(ctx: ServerContext, items: list[dict[str, Any]]) -> dict[str, Any]:
     """Batch channel writes: fader, pan, mute, solo, rename, hide, per item."""
     if not items:
-        return {"results": [], "error": "items was empty; nothing to set."}
+        raise ValueError("items was empty; nothing to set.")
     rig = await ctx.rig()
     results: list[dict[str, Any]] = []
     for item in items:
@@ -751,6 +773,10 @@ async def tool_set_channels(ctx: ServerContext, items: list[dict[str, Any]]) -> 
             results.append(
                 _item_error(item, "every item needs a 'target' (channel name or index).")
             )
+            continue
+        unknown = _unknown_keys(item, _CHANNEL_ITEM_KEYS)
+        if unknown:
+            results.append(_item_error(item, unknown))
             continue
         try:
             channel = rig.resolve(
@@ -918,7 +944,7 @@ async def _send_index(ctx: ServerContext, channel: ChannelInfo, send: str | int)
 async def tool_set_sends(ctx: ServerContext, items: list[dict[str, Any]]) -> dict[str, Any]:
     """Batch send writes: a channel's level, pan or bypass into an aux or cue bus."""
     if not items:
-        return {"results": [], "error": "items was empty; nothing to set."}
+        raise ValueError("items was empty; nothing to set.")
     rig = await ctx.rig()
     results: list[dict[str, Any]] = []
     for item in items:
@@ -926,6 +952,10 @@ async def tool_set_sends(ctx: ServerContext, items: list[dict[str, Any]]) -> dic
             results.append(
                 _item_error(item, "every item needs a 'target' and a 'send' (e.g. 'cue1').")
             )
+            continue
+        unknown = _unknown_keys(item, _SEND_ITEM_KEYS)
+        if unknown:
+            results.append(_item_error(item, unknown))
             continue
         try:
             channel = rig.resolve(
@@ -1123,6 +1153,11 @@ async def tool_talkback(
     """Talkback on/off and level, with an auto-off timer so it cannot be left open."""
     if on is None and level is None:
         raise ValueError("nothing to change: pass on=true/false and/or level (0-100).")
+    if auto_off_s is not None and not float(auto_off_s) > 0:
+        raise ValueError(
+            f"auto_off_s must be above 0 (got {auto_off_s!r}): talkback always has an auto-off "
+            f"timer. Leave it out for the {ctx.talkback_auto_off_s:g} s default."
+        )
     writes: list[dict[str, Any]] = []
     errors: list[str] = []
     if level is not None:
@@ -1149,7 +1184,7 @@ async def tool_talkback(
             refused_by_policy = isinstance(exc, SafetyRefusal)
             errors.append(error_text(exc, client=ctx.client))
 
-    timeout = ctx.talkback_auto_off_s if auto_off_s is None else max(0.0, float(auto_off_s))
+    timeout = ctx.talkback_auto_off_s if auto_off_s is None else float(auto_off_s)
     armed = False
     if on is True and not refused_by_policy and timeout > 0:
         ctx.arm_talkback_auto_off(timeout)
@@ -1216,7 +1251,9 @@ async def tool_set_clock(ctx: ServerContext, source: str, confirm: bool = False)
         "reverted": False,
     }
     if locked:
-        result["ok"] = True
+        result["ok"] = write["verified"]
+        if not write["verified"]:
+            result["error"] = _unverified(write, "/ClockSource")
         return result
     # The revert is best-effort: if IT fails, the populated result must still come back, saying
     # plainly that the rig was left on an unlocked clock source.
@@ -1296,7 +1333,8 @@ async def tool_set_sample_rate(
             "clock, that device must be switched to the same rate too."
         )
     return {
-        "ok": True,
+        "ok": write["verified"],
+        **({} if write["verified"] else {"error": _unverified(write, "/SampleRate")}),
         "resolved": {"path": "/SampleRate", "before": previous, "after": write["after"]},
         "write": {**write, "warnings": warnings},
         "locked": locked,

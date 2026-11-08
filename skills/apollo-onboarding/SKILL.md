@@ -33,7 +33,8 @@ uad_get_status()
 ```
 
 Note `engine.connected`, `clock.source`, `clock.locked`, `clock.sample_rate`, every entry in
-`devices` (a cascade shows more than one), and `safety.mode`. If the mode is `readonly`, stop and
+`devices` (a cascade shows more than one), `safety.mode` and `rig_profile.saved`. If a profile is
+saved, read it with `uad_rig_profile()` and only ask about what it does not cover. If the mode is `readonly`, stop and
 tell the user that nothing can be changed until `UAD_MCP_MODE` is set to `safe` or `full`.
 
 If the engine is unreachable the error says so plainly: the UA Mixer Engine listens on
@@ -214,6 +215,23 @@ Verify signal on everything before declaring victory:
 uad_peek_meters(kind="input")          # at_floor channels are called out for you
 ```
 
+Save what the interview taught you, so no later session has to ask again. Read it back to the
+user first. `sources` replaces the whole list; mic types are `dynamic`, `condenser`, `ribbon`,
+`line`, `unknown`; roles are `voice`, `instrument`, `system_audio`, `call_guest`, `other`:
+
+```
+uad_rig_profile(action="save", sources=[
+  {"target": "LEAD VOX", "plugged_in": "Neumann TLM 103", "mic_type": "condenser", "role": "voice"},
+  {"target": "ANALOG 2", "plugged_in": "Royer R-121", "mic_type": "ribbon", "role": "instrument"},
+  {"target": "SP-404 L", "plugged_in": "Roland SP-404", "mic_type": "line", "role": "instrument"},
+  {"target": "VIRTUAL 1", "role": "system_audio"}
+], notes="ADA8200 on ADAT (Apollo is clock master). KRK monitors. Ableton. OBS for streams.")
+```
+
+A ribbon in the profile makes 48V refused on that input until the profile changes, and
+`uad_mode` takes its defaults from the roles. Never record a mic type the user did not state:
+use `unknown`.
+
 Finish with:
 
 ```
@@ -237,7 +255,7 @@ channels to life at -17.8 dB. The eight channels were then renamed UG 1 to UG 8.
 - **Monitor level:** never raise it to check something. If a level call is refused, read the
   stored level back and relay the remedy from the refusal message.
 - **48V:** ask what the microphone is, then pass both `phantom_48v=true` and
-  `confirm_condenser_mic=true`. Never set it speculatively.
+  `confirm_condenser_mic=true`. Never set it speculatively. Put the answer in the rig profile.
 - **Feedback or anything unexpectedly loud:** call `uad_safe_state()` first, diagnose after. It
   mutes every monitor output and turns talkback off, takes no arguments and needs no confirmation.
 - **Headphone output level cannot be set** by this protocol at all. Build a performer's balance

@@ -6,14 +6,21 @@ Instructions for an LLM driving `uad-console-mcp`. Human-facing docs: [README.md
 ## Orientation
 
 1. This server controls Universal Audio Apollo interfaces through the local UA Mixer Engine on
-   `127.0.0.1:4710`: channels, preamps, sends, monitor, talkback, clock, plugins, meters, snapshots.
-2. Discovery first. Channel counts, indices, monitor output, send IDs and slot counts differ per
+   `127.0.0.1:4710`: channels, preamps, sends, monitor, talkback, clock, plugins, meters, snapshots,
+   plus workflow modes and a read-only map of the driver I/O.
+2. **Know the user's rig before you touch it.** `uad_get_status` then `uad_rig_profile()`. The
+   profile is what the user said is plugged in where (mic models and types, which input is their
+   voice, which virtual pair carries computer audio). The engine cannot know any of that. If
+   `rig_profile.saved` is false, offer the `rig_profile_interview` prompt before the first job.
+3. **A job is a mode.** "I want to stream", "I'm tracking", "I'm mixing now": `uad_mode` with
+   `action="plan"`, show the user the plan, apply with the same arguments on their yes.
+4. Discovery first. Channel counts, indices, monitor output, send IDs and slot counts differ per
    model and are read from the engine, never assumed.
-3. Every write is read back. A write result is `{verified, before, after, warnings}` plus the
+5. Every write is read back. A write result is `{verified, before, after, warnings}` plus the
    resolved `{device, index, name}`.
-4. Refusals are information, not obstacles. Each one names the env var or confirm flag that would
+6. Refusals are information, not obstacles. Each one names the env var or confirm flag that would
    unblock it. Relay it; do not route around it.
-5. This is live audio hardware next to human ears. Loud is irreversible.
+7. This is live audio hardware next to human ears. Loud is irreversible.
 
 ## HARD RULES
 
@@ -44,8 +51,84 @@ Instructions for an LLM driving `uad-console-mcp`. Human-facing docs: [README.md
 11. **With more than one device, always pass `device`.** An index that exists on several Apollos is
     ambiguous, by design.
 12. **Snapshot before experimenting**, and show a `dry_run=true` restore before running it for real.
+13. **Plan a mode before you apply it, and apply it only on the user's yes.** The plan's
+    `questions` block an apply: ask them, never answer them yourself. Relay every `warnings` entry
+    and walk the user through `you_do` one step at a time; those are things only they can do in
+    macOS and their apps. Keep the `snapshot` name an apply returns: restoring it undoes the mode.
+14. **Save what the user tells you about their gear** with `uad_rig_profile(action="save", ...)`,
+    and read it back to them first. `sources` replaces the whole list, so `get` before you `save`.
+    Never write a mic type the user did not state. A ribbon in the profile blocks 48V on that
+    input; when the user says the mic changed, update the profile, do not route around it.
+15. **Never point an app's output at the Apollo's virtual channels and record MON L/R in the same
+    app.** That is a feedback loop through the Console mix. Stream apps monitor to headphones or
+    nowhere.
 
 ## Canonical flows
+
+### Learn the rig once
+
+```
+uad_get_status()                       -> rig_profile.saved false: nobody has described this rig
+uad_list_channels(kind="input")        -> which strips exist, which have a preamp
+  ask: what is on each input you use (model, dynamic / condenser / ribbon / line)? which is your
+       voice? where does computer audio play (usually VIRTUAL 1)? DAW, stream app, monitors?
+uad_rig_profile(action="save", sources=[
+  {"target": "ANALOG 1", "plugged_in": "Shure SM7B", "mic_type": "dynamic", "role": "voice"},
+  {"target": "ANALOG 2", "plugged_in": "Royer R-121", "mic_type": "ribbon", "role": "instrument"},
+  {"target": "VIRTUAL 1", "role": "system_audio"}], notes="Ableton, OBS to Twitch, HS8 monitors")
+  -> {"ribbon_guard": "48V is now refused on ANALOG 2, confirmation or not."}
+```
+
+Sources are stored by device and index, so a later rename does not lose them;
+`uad_rig_profile()` shows `current_name` when a strip was renamed and `missing` when it is gone.
+
+### Livestream: mic plus computer audio
+
+The Apollo does loopback by itself. Computer audio plays into a Virtual strip, Console mixes it
+with the mic (and its UAD plugins), and the driver offers that monitor mix back to apps as the
+inputs `MON L/R`. The stream app records those.
+
+```
+uad_mode(action="plan", mode="livestream")       # inputs and system audio from the profile
+  -> questions: []  (non-empty: ask the user, do not apply)
+  -> channels: [{"target": 0, "device": 0, "mute": false, "fader_db": 0.0}]   only what is off
+  -> warnings: ["The monitors are on with an open mic, which can feed back. ..."]
+  -> you_do: ["Send computer audio to VIRTUAL 1: ... set left to channel 21 and right to
+              channel 22 ...", "In the stream app, record the Apollo's inputs 27-28 (MON L /
+              MON R) ...", "If the stream app only takes inputs 1-2 (most do) ..."]
+  -> check: ["uad_watch_meters(targets=['ANALOG 1', 'VIRTUAL 1'], duration_s=10) ...", ...]
+uad_mode(action="apply", mode="livestream")       # same arguments, after the user agrees
+  -> {"snapshot": "pre-mode-livestream-20261108-064358", "results": {...}, "revert": "..."}
+uad_get_routing()                                 # after the user changes the I/O Matrix:
+  -> loopback.monitor_mix.channels == [1, 2] means apps that only read inputs 1-2 now get the mix
+```
+
+With a remote guest, pass `guest=` (the strip the call app plays into, its own virtual pair). The
+mode builds a mix-minus on `aux2` (or `bus="aux1"`): mic and computer audio in, guest out, aux
+return muted so it does not double up in the monitor mix. The call app records `AUX2 L/R`. Whether
+the driver's AUX capture comes before or after the aux return mute is not verified on hardware:
+the plan's `check` step tells the user what to do if the guest hears nothing.
+
+### Switch jobs and back
+
+```
+uad_mode(action="plan", mode="mixing")            # mutes every hardware input, clears solos
+uad_mode(action="apply", mode="mixing")           -> snapshot "pre-mode-mixing-..."
+...later...
+uad_snapshot(action="restore", name="pre-mode-mixing-...")              # dry run first
+uad_snapshot(action="restore", name="pre-mode-mixing-...", dry_run=false)
+```
+
+`tracking` opens an input and puts it in a headphone cue (`bus="cue1"` by default) and leaves gain
+and 48V to you. No mode ever touches the monitor output, 48V, gain, clock or sample rate, or moves
+a fader or send that is already up.
+
+### What is in that bus?
+
+```
+uad_get_mix(bus="cue1")    -> sources [{name, level_db, pan}], off [...], heard_on ["HP 1"]
+uad_get_mix(bus="aux2")    -> return {fader_db, mute}, plugins, recorded_on {channels: [31, 32]}
+```
 
 ### Label an ADAT expander
 
@@ -74,11 +157,10 @@ uad_set_preamp(target=0, gain_db=26)   # move in <= 6 dB steps, re-measure after
 uad_list_plugins(unison_only=true, authorized_only=true)
 uad_load_plugin(target=0, plugin="UAD UA 610-B", slot="unison")   # exact name from the catalog
   -> {"materialized": true, "parameter_count": N}   materialized false = params not addressable yet
-uad_raw_get(path="/devices/0/inputs/0/sends")     # read before you write: no send-read tool exists
-  -> {"kind": "node", "children": ["0".."5"]}     # one node per send; its ID names the bus
-uad_raw_get(path="/devices/0/inputs/0/sends/2")   # IDs are aux1, aux2, cue1..cue4
-  -> {"properties": {"ID": {"value": "cue1"}, "Gain": {"value": -144.0, "min": -144.0,
-       "max": 12.0}, "Pan": ..., "Bypass": ...}}   # Gain -144..+12 dB; -144.0 = send off
+uad_get_mix(bus="cue1")                            # read before you write
+  -> {"sources": [...], "off": ["LEAD VOX", ...], "heard_on": ["HP 1"]}
+     # send IDs are aux1, aux2, cue1..cue4; level -144..+12 dB; -144.0 = send off
+uad_raw_get(path="/devices/0/inputs/0/sends/2")   # one send's full metadata, if you need it
 uad_set_sends(items=[{"target": 0, "send": "cue1", "level_db": -6}])   # cue3/cue4 nodes exist even
   # where cue_buses is 2: such a write verifies but warns it reaches no real output. Relay it.
 uad_snapshot(action="save", name="vocal-tracking")
@@ -162,6 +244,12 @@ back in `failed` with reasons. Clock, rate and monitor need `include_clock` / `i
 | `active: false` on a stereo right leg | Normal, not a fault. `active` is read-only engine state | Nothing to fix and nothing to write. It is also normal on unused strips and on some outputs (the x8 Gen 2 `MONITOR` output reports `active: false` while working). The writable one is `enabled` (`EnabledByUser`) |
 | a send write returns `verified: true` plus a `cue3`/`cue4` warning | The node exists, but the device has fewer cue buses, so the send reaches no real output | Relay the warning verbatim and rebuild the mix on `cue1`..`cue{cue_buses}` from `uad_get_status` |
 | `engine.audio_streaming: false` in `uad_get_status` | The engine is passing no audio at all | Check this before any meter reading or channel hunt: nothing meters until it is true. Usually no DAW or player has the device open, or the driver is asleep |
+| `Refused to switch 48V on at ...: the rig profile says a ribbon mic` | The user described a ribbon on that input | Tell the user. Only if they say the mic changed: `uad_rig_profile()` then `save` with the new mic type, then retry. Never retry with a different tool |
+| `Refused to switch 48V on at ...: the rig profile could not be read` | The profile file is broken | Show the error. Rebuild the profile with `uad_rig_profile(action="save", ...)`. 48V stays refused until it reads |
+| `Cannot apply <mode> yet: Which input is your microphone? ...` | The mode needs an answer only the user has | Ask the question as written. Then pass `inputs=[...]`, or save the answer in the profile |
+| `The guest and X are the same strip, so the guest would hear themselves` | No separate channel for the call | The call app needs its own strip (its own virtual pair, usually via a router). Explain it; do not apply without one |
+| `Refused to apply <mode>: safety mode is 'readonly'` | Nothing may be written | Report it. Planning still works |
+| a mode plan's `warnings` names 48V | The profile and the live 48V state disagree | A ribbon under 48V: say so first and switch it off on the user's word. A condenser without 48V: ask, then `confirm_condenser_mic=true` |
 
 ## Glossary
 
@@ -185,14 +273,23 @@ back in `failed` with reasons. Clock, rate and monitor need `include_clock` / `i
 | Word clock | BNC clock. `uad_set_clock(source="Word Clock", confirm=true)` |
 | S/MUX | How ADAT carries high rates: 8 channels at 44.1/48 kHz become 4 at 88.2/96 kHz |
 | Snapshot | This server's own state file, not a Console session and not a plugin scene |
+| Rig profile | The user's description of their gear: `uad_rig_profile`, a local JSON file (`UAD_MCP_RIG_PROFILE`, default `~/.uad-console-mcp/rig-profile.json`). Nothing on the Apollo |
+| Mode | A recipe for a job (`livestream`, `tracking`, `mixing`): `uad_mode`. Plan first, apply on a yes, undo with the snapshot it saves |
+| Loopback | Recording what the Apollo plays. The driver inputs `MON L/R` (Console monitor mix), `AUX1 L/R` and `AUX2 L/R` (aux buses) are that. `uad_get_routing` gives their channel numbers |
+| Virtual channel | A software-only Apollo channel. Apps play into it (Audio MIDI Setup > Configure Speakers for system audio); it shows up as a Console strip with `io_type: "Virtual"`. Disabled ones are `active: false` in `uad_get_routing` |
+| I/O Matrix | Console's map of which driver channel number carries what. Read with `uad_get_routing`, changed only in UAD Console > Settings > I/O Matrix (it has a `Livestreaming` preset). Moving it renumbers the DAW's inputs too |
+| Mix-minus | A mix for a remote guest that contains everything except the guest. Built on an aux bus by `uad_mode(mode="livestream", guest=...)` |
 
 ## This server cannot
 
 - Set **headphone output level** (no such property). Use cue-bus send levels plus the knob.
 - Save or recall a **Console session** or a **plugin scene** (`/pluginscenes` writes are always
   denied). Tell the user to press Cmd+S in Console; use `uad_snapshot` for what this server owns.
-- Re-patch **I/O routing** (`/inputroutes`, `/outputroutes` are readable only), or create or delete
-  channels; the strip list is fixed by the model.
+- Re-patch **I/O routing** or pick an **I/O Matrix preset** (`uad_get_routing` reads them; changing
+  them is UAD Console > Settings > I/O Matrix), or create or delete channels; the strip list is
+  fixed by the model.
+- Choose which **app plays to which channel**. That is macOS (Audio MIDI Setup, each app's own
+  device picker). A mode's `you_do` steps say exactly what to pick.
 - Touch **Dante**, or any UA API other than TCP 4710. No remote or networked engines.
 - Record, play or analyse audio (meters poll at about 3 Hz, `uad_watch_meters` caps at 30 s), or
   report **per-plugin DSP cost**; only the totals exist.

@@ -5,10 +5,10 @@ MCP server.
 
 - **`apollo-onboarding`**: plan and configure a rig from scratch. Interview questions, which input
   suits which source, the clock master decision for ADAT expanders, sample-rate and S/MUX limits,
-  multi-Apollo cascades, then channel naming and a baseline snapshot.
-- **`apollo-studio-tasks`**: day-to-day operation. Tracking setup and gain staging, Unison and
-  insert chains, cue mixes, podcast and streaming layouts, troubleshooting decision trees, and
-  snapshot-before-you-experiment habits.
+  multi-Apollo cascades, then channel naming, a saved rig profile and a baseline snapshot.
+- **`apollo-studio-tasks`**: day-to-day operation. Workflow modes, tracking setup and gain
+  staging, Unison and insert chains, cue mixes, livestream and podcast layouts with loopback and a
+  guest mix-minus, troubleshooting decision trees, and snapshot-before-you-experiment habits.
 
 Install for Claude Code (personal skills directory):
 

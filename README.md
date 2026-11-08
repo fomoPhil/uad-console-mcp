@@ -7,7 +7,8 @@
 
 An MCP server that lets Claude (or any MCP client) read and control a Universal Audio Apollo
 interface: channel names and faders, preamp gain, cue and aux sends, the control-room monitor,
-talkback, clock and sample rate, UAD plugin inserts, meters, and whole-rig snapshots. It talks to
+talkback, clock and sample rate, UAD plugin inserts, meters, whole-rig snapshots, and one-call
+setups for jobs like livestreaming your mic with your computer's audio. It talks to
 the **UA Mixer Engine** over its local TCP API on `127.0.0.1:4710`, the same API the Console app
 uses.
 
@@ -238,9 +239,47 @@ uad_watch_meters(targets=["KICK IN","SNARE TOP","OH L","OH R"], duration_s=10, t
 HP 1 is already fed from cue1. The headphone volume itself has to come off the front-panel knob:
 the protocol exposes no level property for the HP outputs."*
 
+## Set it up for a job
+
+Two things make an agent useful on your rig instead of merely careful.
+
+**Tell it your gear once.** Say "learn my setup" (or run the `rig_profile_interview` prompt). The
+agent asks what is plugged into each input, what kind of mic it is, which one is your voice and
+where your computer audio plays, then saves that as a small file on your Mac
+(`~/.uad-console-mcp/rig-profile.json`, or `UAD_MCP_RIG_PROFILE`). Every later session reads it
+first. An input you marked as a **ribbon** refuses 48V outright until you change the profile.
+
+**Then name the job.** `uad_mode` turns a job into the exact Console changes, shows them to you
+first, and only applies them when you say yes. It saves a snapshot before it writes, so one restore
+undoes it.
+
+| You say | Mode | What it does |
+|---|---|---|
+| "I want to stream my mic and my computer audio" | `livestream` | Opens your mic and the virtual strip your Mac plays to, clears solos, and tells you exactly which channels to pick in Audio MIDI Setup and in your stream app. Add a call guest and it builds a mix-minus so they never hear themselves |
+| "I'm recording a vocal" | `tracking` | Opens the input, puts it in a headphone cue, tells you which headphone output and DAW outputs that cue uses |
+| "I'm mixing now" | `mixing` | Mutes every hardware input in the Console mix so only DAW playback reaches your monitors |
+
+No mode raises the monitor, switches 48V, changes gain or the clock, or moves a fader that is
+already up.
+
+**Livestreaming in one picture.** The Apollo does loopback on its own. Your Mac plays into a
+**Virtual** channel, Console mixes it with your mic and its UAD plugins, and the driver hands that
+mix back to your Mac as the inputs **MON L/R**. Your stream app records those.
+
+```
+macOS audio ──> VIRTUAL 1/2 ─┐
+                             ├─> Console monitor mix ──> MON L/R inputs ──> OBS / stream app
+mic + UAD plugins ───────────┘
+```
+
+Most stream and call apps only read inputs 1-2. If yours does, move MON L/R there in UAD Console >
+Settings > I/O Matrix (there is a `Livestreaming` preset); `uad_get_routing` shows where they are
+now. The full walkthrough, including a guest on a call, is in
+[docs/RECIPES.md](docs/RECIPES.md#6-livestream-your-mic-plus-computer-audio).
+
 ## Tool reference
 
-21 tools in `readonly` and `safe` mode, 22 in `full` mode. Every write result carries
+25 tools in `readonly` and `safe` mode, 26 in `full` mode. Every write result carries
 `{verified, before, after, warnings}` plus the resolved `{device, index, name}`, and every tool
 returns an actionable sentence instead of a traceback when something fails.
 
@@ -266,6 +305,10 @@ returns an actionable sentence instead of a traceback when something fails.
 | `uad_peek_meters` | One-shot meter read (level, peak, clip) with at-floor channels called out |
 | `uad_watch_meters` | Poll meters for up to `duration_s` (capped at 30 s) and return the moment any channel crosses `threshold_db` |
 | `uad_snapshot` | `action="save" / "list" / "diff" / "restore"` for whole-rig state. Restore is `dry_run=true` by default and captures a `pre-restore-*` snapshot first |
+| `uad_mode` | `action="plan" / "apply" / "list"` for a job: `livestream`, `tracking`, `mixing`. Plan writes nothing; apply snapshots first, then writes through `uad_set_channels` and `uad_set_sends`. Arguments (`inputs`, `system_audio`, `guest`, `bus`) default to the rig profile |
+| `uad_rig_profile` | `action="get" / "save"`: what is plugged into each input, mic type (`dynamic`, `condenser`, `ribbon`, `line`, `unknown`), role (`voice`, `instrument`, `system_audio`, `call_guest`, `other`) and notes. A local file; nothing is written to the Apollo |
+| `uad_get_routing` | The driver I/O map apps see: input and output channel numbers, where `MON L/R` and `AUX1/AUX2 L/R` loopback land, which virtual outputs feed which strip and whether the I/O Matrix has them enabled. Read-only |
+| `uad_get_mix` | One aux or cue bus: every strip sending to it with level and pan, what is off, and where the bus goes (headphone outputs, or the aux return, its plugins and the inputs that record it). Read-only |
 | `uad_raw_get` | Read any node or property in the engine tree verbatim, with its metadata. One argument, `path` (`uad_raw_get(path="/ClockSource")`). Read-only escape hatch |
 | `uad_raw_set` | **`full` mode only.** Write any property by `path` and `value`, bypassing the allowlist. The monitor rail, denylist and rate limit still apply |
 
@@ -273,8 +316,8 @@ returns an actionable sentence instead of a traceback when something fails.
 
 Four things are readable but easy to miss, because the obvious tool does not return them.
 
-**A send's current level.** There is no send-read tool. Read the send nodes with `uad_raw_get`
-before you write, so you know what you are changing:
+**A send's current level.** `uad_get_mix(bus="cue1")` lists every strip in a bus with its level.
+For one send's full metadata, read the send nodes with `uad_raw_get` before you write:
 
 ```
 uad_raw_get(path="/devices/0/inputs/0/sends")
@@ -319,11 +362,13 @@ channels, sends and the monitor path is wasted effort.
 | `uad://state` | Live `uad_get_status` payload (JSON) |
 | `uad://channels` | Live `uad_list_channels` payload for every input, aux and output (JSON) |
 | `uad://limitations` | The cannot-do list, with a workaround for each item (Markdown) |
+| `uad://rig-profile` | The saved rig profile, with current strip names (JSON) |
 
 ### Prompts
 
-`setup_vocal_tracking`, `onboard_adat_expander`, `troubleshoot_clock`, `panic_reset`. Prose
-versions of all four, plus a gain-staging guide, live in [docs/RECIPES.md](docs/RECIPES.md).
+`setup_vocal_tracking`, `onboard_adat_expander`, `troubleshoot_clock`, `panic_reset`,
+`setup_livestream`, `rig_profile_interview`. Prose versions of all six, plus a guest mix-minus
+recipe and a gain-staging guide, live in [docs/RECIPES.md](docs/RECIPES.md).
 
 ## Not supported
 
@@ -332,9 +377,10 @@ resource says the same thing to the model at runtime.
 
 | Not supported | Why, and what to do instead |
 |---|---|
-| **Headphone output level** | The HP outputs expose no level property at all. On the captured x8 Gen 2 tree, `HP 1` has only `MixInSource` (which cue bus feeds it), `Stereo` and a read-only `Active`. Workaround: pick the cue bus with `MixInSource`, build the balance with `uad_set_sends` into that bus, and use the physical knob for the final trim |
+| **Headphone output level** | The HP outputs expose no level property at all. On the captured x8 Gen 2 tree, `HP 1` has only `MixInSource` (which cue bus feeds it), `Stereo` and a read-only `Active`. Workaround: pick the cue bus for each HP output in Console (`uad_get_mix` shows which output plays which cue), build the balance with `uad_set_sends` into that bus, and use the physical knob for the final trim |
 | **Saving a Console session file** | There is no session save or recall in this API, and writes under `/pluginscenes` are permanently denied. Use `Cmd+S` in Console for a real session file. The workaround inside this server is `uad_snapshot`, which captures every property it is allowed to write and restores them in a safe order (plugins first, monitor last and opt-in) |
-| **Re-patching the I/O matrix** | `/inputroutes` and `/outputroutes` can be read with `uad_raw_get`, but the property carrying the mapping is not on the allowlist and no tool writes it. Re-routing needs Console |
+| **Re-patching the I/O matrix** | `uad_get_routing` reads it, including the I/O Matrix preset, but nothing writes it: a change renumbers every app's channels, the DAW included. Use UAD Console > Settings > I/O Matrix |
+| **Choosing which app plays where** | That is macOS: Audio MIDI Setup > Configure Speakers for system audio, and each app's own device picker. `uad_mode` gives you the exact channel numbers to pick. Apps that only read channels 1-2 need the I/O Matrix change above or a router such as Loopback |
 | **Dante** | No Dante tools, and no Dante routing nodes in the tree this server walks. The x8 Gen 2 reports a read-only `SupportsDante: false`. Dante configuration lives in UA's and Audinate's own software |
 | **Other UA local ports** | Only TCP 4710 is implemented. Whatever the UAD software may offer on other local ports (community projects mention a helper on 4720) is out of scope: not reverse-engineered, not used, not tested |
 | **Remote or networked engines** | `--host` / `--port` exist so `--check` and `--dump-tree` can be pointed at a mock engine. The protocol has no authentication and no encryption, so running it across a network is not a supported configuration |
@@ -390,7 +436,7 @@ Bug reports are far more useful with the `--check` output plus the exact tool ca
 git clone https://github.com/fomoPhil/uad-console-mcp
 cd uad-console-mcp
 uv sync
-uv run pytest            # 543 tests, all against a mock engine, no hardware needed
+uv run pytest            # 572 tests, all against a mock engine, no hardware needed
 uv run ruff check .
 ```
 

@@ -45,7 +45,7 @@ because of one measured fact about the engine:
 |---|---|
 | `readonly` | Nothing is written, ever. Every write is refused before it reaches the socket. Good for a first look, and for letting an LLM inspect a live session during a take |
 | `safe` (**default**) | Writes allowed only to an allowlist of 35 property names: names, faders, pans, mutes, solos, preamp controls, sends, plugin slots and parameters, monitor, talkback, clock, rate, and per-input sample-rate conversion (`SRConvert`). Everything else is refused |
-| `full` | The allowlist is bypassed and `uad_raw_set` is registered. The monitor rail, the permanent denylist, and the write rate limit still apply |
+| `full` | The allowlist is bypassed and `uad_raw_set` is registered. The monitor rail, the permanent denylist, and the write rate limit still apply. `CRMonitorLevelTapered` and `SurroundTrimLevel` are refused because they move the monitor level around the rail, and `uad_raw_set` on `/TalkbackOn` arms the same auto-off timer as `uad_talkback` |
 
 In every mode a permanent denylist refuses device identity and engine internals (`DeviceHwID`,
 `MultiUnitOrder`, `AppCommand`, `MixerState`, `DeviceTypeID`, anything under `/pluginscenes`, and
@@ -64,7 +64,7 @@ loud as setting 0 dB.
 | `UAD_MCP_MAX_MONITOR_STEP_DB` | `6.0` | Largest increase allowed in one call, for requests at or below the ceiling. Bigger jumps are clamped down to this |
 | `UAD_MCP_MONITOR_WINDOW_DB` | `10.0` | Total increase allowed inside the rolling window |
 | `UAD_MCP_MONITOR_WINDOW_SECONDS` | `30.0` | Length of that rolling window, in seconds |
-| `UAD_MCP_WRITES_PER_SECOND` | `10.0` | Global write rate limit (token bucket), so a confused agent cannot machine-gun the engine |
+| `UAD_MCP_WRITES_PER_SECOND` | `10.0` | Global write rate limit (token bucket), so a confused agent cannot machine-gun the engine. Mutes and talkback-off are never limited, so `uad_safe_state` always gets through |
 | `UAD_MCP_WRITE_BURST` | `20` | Burst size for that rate limit |
 | `UAD_MCP_ALLOW_READONLY_WRITES` | `0` | Off by default: writes to properties the engine marks read-only are refused. Only set this if you know exactly which property you mean |
 | `UAD_MCP_SNAPSHOT_DIR` | `~/.uad-console-mcp/snapshots` | Where `uad_snapshot` files are written |
@@ -390,16 +390,19 @@ Bug reports are far more useful with the `--check` output plus the exact tool ca
 git clone https://github.com/fomoPhil/uad-console-mcp
 cd uad-console-mcp
 uv sync
-uv run pytest            # 500 tests, all against a mock engine, no hardware needed
+uv run pytest            # 543 tests, all against a mock engine, no hardware needed
 uv run ruff check .
 ```
 
 A further 7 tests in `tests/live/` are marked `live`: they need a real engine and a real Apollo,
-and are excluded by default (`addopts = -m 'not live'`). Run them deliberately, never in CI:
+and are excluded by default (`addopts = -m 'not live and not slow'`). Run them deliberately, never
+in CI:
 
 ```bash
 UAD_MCP_LIVE=1 uv run pytest -m live
 ```
+
+The randomized soak test against the mock engine is marked `slow`: `uv run pytest -m slow`.
 
 Two rules in this codebase are not negotiable:
 

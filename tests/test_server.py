@@ -182,6 +182,38 @@ async def test_get_status_reports_every_unit_of_a_cascade(
     assert all(device["online"] for device in result["devices"])
 
 
+def same_name_cascade(base: Tree) -> Tree:
+    """A real cascade: both units name their strips identically (the derived one prefixes B)."""
+    tree = cascade_fixture(base)
+    for path, node in tree["nodes"].items():
+        name = node["properties"].get("Name")
+        if path.startswith("/devices/1/inputs/") and isinstance(name, dict):
+            name["value"] = name["value"].removeprefix("B ")
+    return tree
+
+
+async def test_watch_meters_keeps_same_named_cascade_channels_apart(
+    mock_factory: Any, base_fixture: Tree
+) -> None:
+    """Audit M1: two units' 'ANALOG 1' must not merge into one peak."""
+    engine = await mock_factory(same_name_cascade(base_fixture))
+    engine.nodes["/devices/1/inputs/0/meters/0"]["properties"]["MeterLevel"]["value"] = -10.0
+    async with context(engine) as ctx:
+        result = await srv.tool_watch_meters(ctx, duration_s=0.1, threshold_db=-20)
+    assert result["triggered_channels"] == ["ANALOG 1 (device 1)"]
+    assert result["peaks_db"]["ANALOG 1 (device 1)"] == -10.0
+    assert result["peaks_db"]["ANALOG 1 (device 0)"] < -70
+
+
+async def test_a_numeric_device_string_is_an_index(mock: MockEngine) -> None:
+    """Audit M2: device='2' must not match 'Apollo x8 Gen 2' by name."""
+    async with context(mock) as ctx:
+        rig = await ctx.rig()
+        assert rig.resolve("ANALOG 1", device="0").device == 0
+        with pytest.raises(srv.TargetNotFoundError):
+            rig.resolve("ANALOG 1", device="2")
+
+
 async def test_list_channels_golden_shape(mock: MockEngine) -> None:
     async with context(mock) as ctx:
         result = await srv.tool_list_channels(ctx)
@@ -397,6 +429,24 @@ async def test_set_sends_requires_target_and_send(mock: MockEngine) -> None:
     assert "needs a 'target' and a 'send'" in result["results"][0]["error"]
 
 
+async def test_batch_items_with_unknown_keys_write_nothing(mock: MockEngine) -> None:
+    """Audit M4: a typo like 'volume' must fail the item, not vanish behind a rename."""
+    async with context(mock) as ctx:
+        channels = await srv.tool_set_channels(
+            ctx, [{"target": "ANALOG 1", "name": "KICK", "volume": -6}]
+        )
+        sends = await srv.tool_set_sends(
+            ctx, [{"target": "ANALOG 1", "send": "cue1", "level": -6}]
+        )
+        empty = await srv.tool_set_channels(ctx, [])
+    assert channels["ok"] is False
+    assert "'volume'" in channels["results"][0]["error"]
+    assert "fader_db" in channels["results"][0]["error"]
+    assert sends["ok"] is False and "'level'" in sends["results"][0]["error"]
+    assert empty["ok"] is False and "items was empty" in empty["error"]
+    assert mock.set_count() == 0
+
+
 # --------------------------------------------------------------------------------- monitor
 
 
@@ -454,6 +504,35 @@ async def test_no_sequence_of_monitor_calls_can_pass_the_ceiling(mock: MockEngin
             level = mock.value(MONITOR_LEVEL)
             assert level is not None
             assert level <= ceiling + 1e-9, f"step {step}: {level} exceeded the {ceiling} ceiling"
+
+
+async def test_concurrent_monitor_calls_cannot_beat_the_window_budget(
+    mock: MockEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Audit H3: MCP runs tool calls concurrently; parallel raises must share one budget.
+
+    A slow read-back holds each call between its write and its budget record, and the next call
+    starts in that gap, which is the interleaving that used to let every call see an empty window.
+    """
+    gate = SafetyGate("safe", max_monitor_db=0.0, writes_per_second=500.0, write_burst=500)
+    await mock.push(MONITOR_LEVEL, -40.0)
+    async with context(mock, gate=gate) as ctx:
+        await srv.tool_list_channels(ctx)  # warm the topology cache
+        real_set = ctx.client.set_value
+
+        async def slow_verify(path: str, value: Any) -> Any:
+            applied = await real_set(path, value)
+            await asyncio.sleep(0.05)
+            return applied
+
+        monkeypatch.setattr(ctx.client, "set_value", slow_verify)
+
+        async def raise_by_six(delay: float) -> None:
+            await asyncio.sleep(delay)
+            await srv.tool_set_monitor(ctx, level_db=0.0)
+
+        await asyncio.gather(*(raise_by_six(0.01 * i) for i in range(4)))
+    assert mock.value(MONITOR_LEVEL) <= -40.0 + gate.describe()["monitor_window_db"] + 1e-9
 
 
 async def test_the_server_never_newly_exposes_an_above_ceiling_level(mock: MockEngine) -> None:
@@ -750,6 +829,47 @@ async def test_repeat_talkback_calls_replace_the_timer(mock: MockEngine) -> None
         assert mock.value("/TalkbackOn") is False
 
 
+@pytest.mark.parametrize("auto_off_s", [0, -1.0])
+async def test_talkback_timer_cannot_be_switched_off(mock: MockEngine, auto_off_s: float) -> None:
+    """Audit M6: 'cannot be forgotten' means there is always a timer."""
+    async with context(mock) as ctx:
+        result = await srv.tool_talkback(ctx, on=True, auto_off_s=auto_off_s)
+    assert result["ok"] is False
+    assert "auto_off_s must be above 0" in result["error"]
+    assert mock.value("/TalkbackOn") is False
+
+
+async def test_shutdown_closes_talkback_this_server_opened(mock: MockEngine) -> None:
+    """Audit H1: a client that disconnects inside the auto-off window must not leave a live mic."""
+    async with context(mock) as ctx:
+        await srv.tool_talkback(ctx, on=True, auto_off_s=30.0)
+        assert mock.value("/TalkbackOn") is True
+        await ctx.shutdown()
+        assert mock.value("/TalkbackOn") is False
+        assert ctx.talkback_timer_running is False
+
+
+async def test_shutdown_leaves_talkback_alone_without_a_timer(mock: MockEngine) -> None:
+    """Talkback opened from Console (no timer of ours) is not this server's to close."""
+    async with context(mock) as ctx:
+        await mock.push("/TalkbackOn", True)
+        await ctx.shutdown()
+        assert mock.value("/TalkbackOn") is True
+        assert mock.set_count() == 0
+
+
+async def test_serve_runs_shutdown_in_the_same_loop(mock: MockEngine) -> None:
+    """Audit H1: cleanup happens before the serving loop ends, so the write still lands."""
+    async with context(mock) as ctx:
+
+        class FakeServer:
+            async def run_stdio_async(self) -> None:
+                await srv.tool_talkback(ctx, on=True, auto_off_s=30.0)
+
+        await cli._serve(FakeServer(), ctx, ctx.client)
+    assert mock.value("/TalkbackOn") is False
+
+
 async def test_talkback_arms_the_timer_even_when_the_level_write_fails(
     mock: MockEngine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -898,7 +1018,35 @@ async def test_safe_state_mutes_monitors_and_kills_talkback(mock: MockEngine) ->
     assert "uad_set_monitor(mute=false)" in result["next"]
 
 
+async def test_safe_state_works_with_an_empty_rate_limit_bucket(mock: MockEngine) -> None:
+    """Audit H2: a runaway agent empties the bucket; the panic button must still land."""
+    gate = SafetyGate("safe", writes_per_second=0.01, write_burst=2)
+    async with context(mock, gate=gate) as ctx:
+        await mock.push("/TalkbackOn", True)
+        await srv.tool_set_channels(ctx, [{"target": i, "fader_db": -1} for i in range(3)])
+        result = await srv.tool_safe_state(ctx)
+    assert result["ok"] is True, result.get("errors")
+    assert mock.value(f"{MONITOR}/Mute") is True
+    assert mock.value("/TalkbackOn") is False
+
+
 # ----------------------------------------------------------------------------------- clock
+
+
+@pytest.mark.parametrize("missing", ["all", "one"])
+async def test_clock_change_fails_closed_when_meters_cannot_be_read(
+    mock: MockEngine, missing: str
+) -> None:
+    """Audit H4: an unread meter is not a silent meter."""
+    for path, node in mock.nodes.items():
+        if "/meters/" in path and (missing == "all" or path.startswith(f"{IN0}/meters/")):
+            node["properties"].pop("MeterLevel", None)
+    async with context(mock) as ctx:
+        result = await srv.tool_set_clock(ctx, "ADAT", confirm=True)
+    assert result["ok"] is False
+    assert "no proof that audio is silent" in result["error"]
+    assert mock.value("/ClockSource") == "Internal"
+    assert mock.set_count() == 0
 
 
 async def test_set_clock_requires_confirmation(mock: MockEngine) -> None:
@@ -1035,6 +1183,25 @@ async def test_set_sample_rate_rejects_a_rate_the_engine_does_not_offer(mock: Mo
     assert result["ok"] is False
     assert "not one of its allowed values" in result["error"]
     assert mock.value("/SampleRate") == 48000
+
+
+@pytest.mark.parametrize("tool_name", ["rate", "clock"])
+async def test_an_unverified_transport_write_is_not_ok(
+    mock: MockEngine, monkeypatch: pytest.MonkeyPatch, tool_name: str
+) -> None:
+    """Audit M5: the engine keeping its old value is a failure, whatever ClockLocked says."""
+    async with context(mock) as ctx:
+
+        async def ignored(path: str, value: Any) -> Any:
+            return mock.value(path)
+
+        monkeypatch.setattr(ctx.client, "set_value", ignored)
+        if tool_name == "rate":
+            result = await srv.tool_set_sample_rate(ctx, 96000, confirm=True)
+        else:
+            result = await srv.tool_set_clock(ctx, "ADAT", confirm=True)
+    assert result["ok"] is False
+    assert "do not retry" in result["error"]
 
 
 # --------------------------------------------------------------------------------- plugins
@@ -1444,6 +1611,45 @@ async def test_full_mode_still_rails_the_monitor(mock: MockEngine) -> None:
     assert result["ok"] is False
     assert "ceiling" in result["error"]
     assert mock.value(MONITOR_LEVEL) == -22.0
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (f"{MONITOR}/CRMonitorLevelTapered", 1.0),
+        (f"{MONITOR}/SurroundTrimLevel", 10.0),
+        (f"{MONITOR_MUTE}/value", False),
+        (f"/{MONITOR_MUTE}", False),
+    ],
+)
+async def test_full_mode_has_no_way_around_the_monitor_rail(
+    mock: MockEngine, path: str, value: Any
+) -> None:
+    """Audit H5: other spellings and other level properties must not dodge the rail."""
+    async with context(mock, "full") as ctx:
+        await mock.push(MONITOR_LEVEL, -2.0)
+        await mock.push(MONITOR_MUTE, True)
+        result = await srv.tool_raw_set(ctx, path, value)
+    assert result["ok"] is False, path
+    assert mock.value(f"{MONITOR}/CRMonitorLevelTapered") == pytest.approx(0.3541666567325592)
+    assert mock.value(f"{MONITOR}/SurroundTrimLevel") == 0.0
+    assert mock.value(MONITOR_MUTE) is True
+
+
+async def test_raw_set_refuses_dot_segments(mock: MockEngine) -> None:
+    async with context(mock, "full") as ctx:
+        result = await srv.tool_raw_set(ctx, "/devices/../pluginscenes/0/Name", "x")
+    assert result["ok"] is False and "'..'" in result["error"]
+    assert mock.set_count() == 0
+
+
+async def test_raw_set_talkback_on_arms_the_auto_off_timer(mock: MockEngine) -> None:
+    """Audit H5: raw_set must not be a way to open talkback with no timer behind it."""
+    async with context(mock, "full", talkback_auto_off_s=0.05) as ctx:
+        result = await srv.tool_raw_set(ctx, "/TalkbackOn", True)
+        assert result["ok"] is True
+        assert "auto-off armed" in " ".join(result["writes"][0]["warnings"])
+        assert await wait_until(lambda: mock.value("/TalkbackOn") is False)
 
 
 @pytest.mark.parametrize("prop", ["Mute", "DimOn"])
@@ -1864,6 +2070,29 @@ async def test_a_registered_tool_can_be_called_through_mcp(mock: MockEngine) -> 
         result = await srv.build_server(ctx).call_tool("uad_list_channels", {"kind": "aux"})
     payload = getattr(result, "structuredContent", None) or {}
     assert payload.get("total") == 2 or "AUX 1" in str(result)
+
+
+async def test_a_failed_tool_sets_is_error_and_a_good_one_does_not(mock: MockEngine) -> None:
+    """Audit M3: clients and models key on isError, so a refusal must not read as success."""
+    async with context(mock) as ctx:
+        server = srv.build_server(ctx)
+        good = await server.call_tool("uad_list_channels", {"kind": "aux"})
+        bad = await server.call_tool("uad_set_preamp", {"target": "UG 1", "gain_db": 10})
+    assert good.is_error is False
+    assert good.structured_content["total"] == 2
+    assert bad.is_error is True
+    assert "has no preamp" in bad.structured_content["error"]
+
+
+async def test_read_tools_are_hinted_read_only_and_kind_is_an_enum(mock: MockEngine) -> None:
+    """Audit M7: clients can auto-approve reads, and models see the allowed kinds."""
+    async with context(mock, "full") as ctx:
+        tools = {tool.name: tool for tool in await srv.build_server(ctx).list_tools()}
+    hinted = {name for name, tool in tools.items() if tool.annotations is not None}
+    assert hinted == srv.READ_ONLY_TOOLS
+    assert all(tools[name].annotations.read_only_hint for name in hinted)
+    kind = tools["uad_list_channels"].input_schema["properties"]["kind"]
+    assert kind["enum"] == ["input", "aux", "output", "all"]
 
 
 async def test_the_clock_prompt_encodes_the_real_diagnosis(mock: MockEngine) -> None:

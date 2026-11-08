@@ -28,7 +28,7 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
-from typing import Any
+from typing import Any, Literal
 
 from . import __version__, snapshot
 from .client import (
@@ -54,6 +54,7 @@ from .safety import (
     SafetyGate,
     SafetyRefusal,
     WriteContext,
+    canonical_path,
     coerces_to_false,
     gate_from_env,
     property_name,
@@ -201,6 +202,17 @@ def tool(fn: ToolFn) -> ToolFn:
     return wrapper
 
 
+def monitor_serialized(fn: ToolFn) -> ToolFn:
+    """Run a tool that can reach the monitor rail under :attr:`ServerContext.monitor_lock`."""
+
+    @functools.wraps(fn)
+    async def wrapper(ctx: ServerContext, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        async with ctx.monitor_lock:
+            return await fn(ctx, *args, **kwargs)
+
+    return wrapper
+
+
 # ---------------------------------------------------------------------------------- context
 
 
@@ -239,6 +251,9 @@ class ServerContext:
         self._catalog: list[dict[str, Any]] | None = None
         self._catalog_at = 0.0
         self._talkback_task: asyncio.Task[None] | None = None
+        #: Serializes every tool that can raise the monitor level. The rolling budget is
+        #: read-check-write-record, and MCP runs tool calls concurrently.
+        self.monitor_lock = asyncio.Lock()
         client.on_reconnect(self._on_reconnect)
 
     # ------------------------------------------------------------------- topology cache
@@ -294,6 +309,25 @@ class ServerContext:
         logger.info("control socket reconnected: dropping the topology cache")
         self.invalidate()
 
+    async def shutdown(self, timeout_s: float = 3.0) -> None:
+        """End of session: if this server's talkback timer is still pending, close talkback now.
+
+        The timer dies with the event loop, so without this an MCP client that disconnects within
+        the auto-off window leaves a live talkback mic open with nothing left to close it.
+        """
+        if self.talkback_timer_running:
+            self.cancel_talkback_auto_off()
+            try:
+                await asyncio.wait_for(
+                    self.write(
+                        TALKBACK_ON_PATH, False, context=WriteContext(reason="server shutdown")
+                    ),
+                    timeout_s,
+                )
+            except Exception as exc:
+                logger.error("could not turn talkback off at shutdown: %s", exc)
+        await self.aclose()
+
     async def aclose(self) -> None:
         """Cancel the talkback timer. The client is owned by whoever built it."""
         self.cancel_talkback_auto_off()
@@ -332,13 +366,24 @@ class ServerContext:
         values = await self.poll(list(paths))
         peak = METER_FLOOR_DB
         where: str | None = None
+        read: set[str] = set()
         for path, raw in values.items():
             if not isinstance(raw, int | float) or isinstance(raw, bool):
                 continue
+            read.add(paths[path].path)
             level = float(raw)
             if level > peak:
                 peak = level
                 where = paths[path].name
+        unread = [channel.label() for channel in inputs if channel.path not in read]
+        if unread:
+            # A meter that did not answer is not a silent meter. Fail closed.
+            shown = ", ".join(unread[:8]) + (", ..." if len(unread) > 8 else "")
+            raise UAError(
+                f"Could not read the input meters of {len(unread)} channel(s) ({shown}), so "
+                "there is no proof that audio is silent. Check uad_peek_meters, then retry; "
+                "nothing was changed."
+            )
         return peak > AUDIO_FLOWING_DB, peak, where
 
     # -------------------------------------------------------------------------- writes
@@ -535,6 +580,25 @@ def _item_error(item: Mapping[str, Any], message: str) -> dict[str, Any]:
     return {"target": item.get("target"), "ok": False, "error": message}
 
 
+def _unverified(write: Mapping[str, Any], path: str) -> str:
+    return (
+        f"The engine reports {write['after']!r} after writing {path}, not the requested value. "
+        f"Treat this as a failure: read it with uad_raw_get(path={path!r}) and do not retry."
+    )
+
+
+def _unknown_keys(item: Mapping[str, Any], allowed: Iterable[str]) -> str | None:
+    """An error sentence for keys a batch item does not understand, so a typo is not a no-op."""
+    known = set(allowed)
+    extra = sorted(str(key) for key in item if key not in known)
+    if not extra:
+        return None
+    return (
+        f"unknown key(s) {', '.join(repr(key) for key in extra)}; nothing was written for this "
+        f"item. Allowed keys: {', '.join(sorted(known))}."
+    )
+
+
 async def _monitor_rail_state(
     ctx: ServerContext, strip_path: str
 ) -> tuple[float | None, bool | None]:
@@ -563,6 +627,9 @@ _CHANNEL_FIELDS: tuple[tuple[str, str], ...] = (
     ("enabled", "EnabledByUser"),
 )
 """Tool-facing name -> engine property, in the order writes are applied."""
+
+_CHANNEL_ITEM_KEYS = ("target", "device", "kind", *(key for key, _ in _CHANNEL_FIELDS))
+_SEND_ITEM_KEYS = ("target", "send", "device", "kind", "level_db", "pan", "bypass")
 
 
 # ------------------------------------------------------------------------------- status
@@ -694,10 +761,11 @@ async def tool_list_channels(
 
 
 @tool
+@monitor_serialized
 async def tool_set_channels(ctx: ServerContext, items: list[dict[str, Any]]) -> dict[str, Any]:
     """Batch channel writes: fader, pan, mute, solo, rename, hide, per item."""
     if not items:
-        return {"results": [], "error": "items was empty; nothing to set."}
+        raise ValueError("items was empty; nothing to set.")
     rig = await ctx.rig()
     results: list[dict[str, Any]] = []
     for item in items:
@@ -705,6 +773,10 @@ async def tool_set_channels(ctx: ServerContext, items: list[dict[str, Any]]) -> 
             results.append(
                 _item_error(item, "every item needs a 'target' (channel name or index).")
             )
+            continue
+        unknown = _unknown_keys(item, _CHANNEL_ITEM_KEYS)
+        if unknown:
+            results.append(_item_error(item, unknown))
             continue
         try:
             channel = rig.resolve(
@@ -872,7 +944,7 @@ async def _send_index(ctx: ServerContext, channel: ChannelInfo, send: str | int)
 async def tool_set_sends(ctx: ServerContext, items: list[dict[str, Any]]) -> dict[str, Any]:
     """Batch send writes: a channel's level, pan or bypass into an aux or cue bus."""
     if not items:
-        return {"results": [], "error": "items was empty; nothing to set."}
+        raise ValueError("items was empty; nothing to set.")
     rig = await ctx.rig()
     results: list[dict[str, Any]] = []
     for item in items:
@@ -880,6 +952,10 @@ async def tool_set_sends(ctx: ServerContext, items: list[dict[str, Any]]) -> dic
             results.append(
                 _item_error(item, "every item needs a 'target' and a 'send' (e.g. 'cue1').")
             )
+            continue
+        unknown = _unknown_keys(item, _SEND_ITEM_KEYS)
+        if unknown:
+            results.append(_item_error(item, unknown))
             continue
         try:
             channel = rig.resolve(
@@ -937,6 +1013,7 @@ async def tool_set_sends(ctx: ServerContext, items: list[dict[str, Any]]) -> dic
 
 
 @tool
+@monitor_serialized
 async def tool_set_monitor(
     ctx: ServerContext,
     device: int | None = None,
@@ -1076,6 +1153,11 @@ async def tool_talkback(
     """Talkback on/off and level, with an auto-off timer so it cannot be left open."""
     if on is None and level is None:
         raise ValueError("nothing to change: pass on=true/false and/or level (0-100).")
+    if auto_off_s is not None and not float(auto_off_s) > 0:
+        raise ValueError(
+            f"auto_off_s must be above 0 (got {auto_off_s!r}): talkback always has an auto-off "
+            f"timer. Leave it out for the {ctx.talkback_auto_off_s:g} s default."
+        )
     writes: list[dict[str, Any]] = []
     errors: list[str] = []
     if level is not None:
@@ -1102,7 +1184,7 @@ async def tool_talkback(
             refused_by_policy = isinstance(exc, SafetyRefusal)
             errors.append(error_text(exc, client=ctx.client))
 
-    timeout = ctx.talkback_auto_off_s if auto_off_s is None else max(0.0, float(auto_off_s))
+    timeout = ctx.talkback_auto_off_s if auto_off_s is None else float(auto_off_s)
     armed = False
     if on is True and not refused_by_policy and timeout > 0:
         ctx.arm_talkback_auto_off(timeout)
@@ -1169,7 +1251,9 @@ async def tool_set_clock(ctx: ServerContext, source: str, confirm: bool = False)
         "reverted": False,
     }
     if locked:
-        result["ok"] = True
+        result["ok"] = write["verified"]
+        if not write["verified"]:
+            result["error"] = _unverified(write, "/ClockSource")
         return result
     # The revert is best-effort: if IT fails, the populated result must still come back, saying
     # plainly that the rig was left on an unlocked clock source.
@@ -1249,7 +1333,8 @@ async def tool_set_sample_rate(
             "clock, that device must be switched to the same rate too."
         )
     return {
-        "ok": True,
+        "ok": write["verified"],
+        **({} if write["verified"] else {"error": _unverified(write, "/SampleRate")}),
         "resolved": {"path": "/SampleRate", "before": previous, "after": write["after"]},
         "write": {**write, "warnings": warnings},
         "locked": locked,
@@ -1760,6 +1845,16 @@ async def tool_watch_meters(
         for channel in channels
         for meter in (0, 1)
     }
+    names = [channel.name for channel in channels]
+    # Cascaded Apollos repeat strip names ("ANALOG 1" on every unit): say which device.
+    labels = {
+        channel.path: (
+            f"{channel.name} (device {channel.device})"
+            if names.count(channel.name) > 1
+            else channel.name
+        )
+        for channel in channels
+    }
     peaks: dict[str, float] = {}
     triggered: list[str] = []
     loop = asyncio.get_running_loop()
@@ -1773,11 +1868,11 @@ async def tool_watch_meters(
             level = _number(raw)
             if level is None:
                 continue
-            channel = level_paths[path]
-            if level > peaks.get(channel.name, float("-inf")):
-                peaks[channel.name] = level
-            if level > threshold_db and channel.name not in triggered:
-                triggered.append(channel.name)
+            label = labels[level_paths[path].path]
+            if level > peaks.get(label, float("-inf")):
+                peaks[label] = level
+            if level > threshold_db and label not in triggered:
+                triggered.append(label)
         if triggered:
             break
         remaining = deadline - loop.time()
@@ -1865,18 +1960,19 @@ async def tool_snapshot(
     flowing: bool | None = None
     if include_clock:
         flowing, _, _ = await ctx.audio_flowing()
-    result = await snapshot.restore(
-        ctx.client,
-        rig,
-        doc,
-        gate=ctx.gate,
-        dry_run=dry_run,
-        include_clock=include_clock,
-        include_monitor=include_monitor,
-        allow_cross_model=allow_cross_model,
-        audio_flowing=flowing,
-        store=store,
-    )
+    async with ctx.monitor_lock:
+        result = await snapshot.restore(
+            ctx.client,
+            rig,
+            doc,
+            gate=ctx.gate,
+            dry_run=dry_run,
+            include_clock=include_clock,
+            include_monitor=include_monitor,
+            allow_cross_model=allow_cross_model,
+            audio_flowing=flowing,
+            store=store,
+        )
     return {"action": "restore", "name": name, **result}
 
 
@@ -1983,6 +2079,7 @@ async def _raw_dim_attenuation_context(
 
 
 @tool
+@monitor_serialized
 async def tool_raw_set(ctx: ServerContext, path: str, value: Any) -> dict[str, Any]:
     """Write any property directly. Registered only when UAD_MCP_MODE=full."""
     if ctx.gate.mode != "full":
@@ -1990,7 +2087,21 @@ async def tool_raw_set(ctx: ServerContext, path: str, value: Any) -> dict[str, A
             f"uad_raw_set is only available when UAD_MCP_MODE=full (current mode: "
             f"{ctx.gate.mode!r}). Use the specific tool for this property instead."
         )
-    write = await ctx.write(path, value, context=await _raw_write_context(ctx, path, value))
+    path = canonical_path(path)
+    opens_talkback = path == TALKBACK_ON_PATH and not coerces_to_false(value)
+    try:
+        write = await ctx.write(path, value, context=await _raw_write_context(ctx, path, value))
+    except SafetyRefusal:
+        raise
+    except Exception:
+        if opens_talkback:  # the write may have landed: never leave an open mic untimed
+            ctx.arm_talkback_auto_off(ctx.talkback_auto_off_s)
+        raise
+    if opens_talkback:
+        ctx.arm_talkback_auto_off(ctx.talkback_auto_off_s)
+        write["warnings"].append(f"talkback auto-off armed for {ctx.talkback_auto_off_s:g} s")
+    elif path == TALKBACK_ON_PATH:
+        ctx.cancel_talkback_auto_off()
     return {"writes": [write]}
 
 
@@ -2124,21 +2235,32 @@ unmute everything at once; change the clock source or sample rate; or engage 48V
 # --------------------------------------------------------------------------- registration
 
 
+READ_ONLY_TOOLS = frozenset(
+    {
+        "uad_get_status",
+        "uad_list_channels",
+        "uad_list_plugins",
+        "uad_get_inserts",
+        "uad_get_plugin_params",
+        "uad_peek_meters",
+        "uad_watch_meters",
+        "uad_raw_get",
+    }
+)
+
+ChannelKindArg = Literal["input", "aux", "output"]
+
+
 def _server_class() -> Any:
-    """The decorator-style MCP server class, whatever the installed ``mcp`` calls it.
+    """The decorator-style MCP server class (``MCPServer``; ``pyproject.toml`` pins mcp 2.x).
 
     SPEC §4.5 says ``FastMCP``; mcp 2.x renamed the identical decorator API to ``MCPServer``.
     Imported lazily so the tool functions above stay importable (and unit-testable) even if the
     ``mcp`` package is not installed at all.
     """
-    try:
-        from mcp.server import MCPServer
+    from mcp.server import MCPServer
 
-        return MCPServer
-    except ImportError:  # pragma: no cover - mcp < 2.0
-        from mcp.server.fastmcp import FastMCP
-
-        return FastMCP
+    return MCPServer
 
 
 def build_server(ctx: ServerContext) -> Any:
@@ -2160,15 +2282,35 @@ def build_server(ctx: ServerContext) -> Any:
         ),
     )
 
+    from mcp.types import CallToolResult, TextContent, ToolAnnotations
+
     registered: list[str] = []
 
     def register(**kwargs: Any) -> Callable[[ToolFn], ToolFn]:
-        """Register a tool and remember its name, so the count can be logged and asserted."""
+        """Register a tool and remember its name, so the count can be logged and asserted.
+
+        Read-only tools carry ``readOnlyHint`` so clients can tell them from writes, and a tool
+        that failed outright comes back with ``isError: true`` as well as its ``error`` sentence.
+        """
+        name = str(kwargs["name"])
+        if name in READ_ONLY_TOOLS:
+            kwargs["annotations"] = ToolAnnotations(read_only_hint=True)
         decorate = server.tool(**kwargs)
 
         def wrap(fn: ToolFn) -> ToolFn:
-            registered.append(str(kwargs["name"]))
-            return decorate(fn)
+            @functools.wraps(fn)
+            async def call(*args: Any, **inner: Any) -> Any:
+                result = await fn(*args, **inner)
+                if result.get("ok") is False and "error" in result:
+                    return CallToolResult(
+                        content=[TextContent(type="text", text=json.dumps(result, default=str))],
+                        structured_content=result,
+                        is_error=True,
+                    )
+                return result
+
+            registered.append(name)
+            return decorate(call)
 
         return wrap
 
@@ -2196,7 +2338,9 @@ def build_server(ctx: ServerContext) -> Any:
         ),
     )
     async def uad_list_channels(
-        kind: str = "input", device: int | None = None, include_hidden: bool = True
+        kind: Literal["input", "aux", "output", "all"] = "input",
+        device: int | None = None,
+        include_hidden: bool = True,
     ) -> dict[str, Any]:
         return await tool_list_channels(
             ctx, kind=kind, device=device, include_hidden=include_hidden
@@ -2273,9 +2417,10 @@ def build_server(ctx: ServerContext) -> Any:
         name="uad_set_monitor",
         description=(
             "Set the control-room monitor: level_db (hard-railed), dim, mute, mono fold, alt "
-            "speaker selection, dim attenuation. Unmuting, un-dimming and LOWERING "
-            "dim_attenuation_db are all treated as level events and can be refused; level_db is "
-            "written first and the release is railed against the level the engine reports back.\n"
+            "speaker selection, dim attenuation. A level_db above the ceiling is refused, not "
+            "clamped. Unmuting, un-dimming and LOWERING dim_attenuation_db are all treated as "
+            "level events and can be refused; level_db is written first and the release is railed "
+            "against the level the engine reports back.\n"
             "Use when: changing what the control room hears, or recovering after uad_safe_state.\n"
             "Not for: headphone level - the protocol cannot set it; see uad://limitations."
         ),
@@ -2304,7 +2449,8 @@ def build_server(ctx: ServerContext) -> Any:
         name="uad_talkback",
         description=(
             "Turn talkback on or off and set its level, with an auto-off timer (default 30 s) so "
-            "an open talkback mic cannot be forgotten. Calling it again replaces the timer.\n"
+            "an open talkback mic cannot be forgotten. auto_off_s must be above 0. Calling it "
+            "again replaces the timer.\n"
             "Use when: the engineer needs to speak to the live room.\n"
             "Not for: routing the talkback mic or choosing which mic it is - that is set in "
             "Console."
@@ -2391,7 +2537,7 @@ def build_server(ctx: ServerContext) -> Any:
     async def uad_get_inserts(
         target: str | int | None = None,
         device: int | None = None,
-        kind: str = "input",
+        kind: ChannelKindArg = "input",
         loaded_only: bool = True,
     ) -> dict[str, Any]:
         return await tool_get_inserts(
@@ -2499,7 +2645,7 @@ def build_server(ctx: ServerContext) -> Any:
     )
     async def uad_peek_meters(
         targets: list[str] | None = None,
-        kind: str = "input",
+        kind: ChannelKindArg = "input",
         device: int | None = None,
         above_db: float | None = None,
     ) -> dict[str, Any]:
@@ -2522,7 +2668,7 @@ def build_server(ctx: ServerContext) -> Any:
         duration_s: float = 5.0,
         threshold_db: float = AUDIO_FLOWING_DB,
         interval_s: float = DEFAULT_WATCH_INTERVAL_S,
-        kind: str = "input",
+        kind: ChannelKindArg = "input",
         device: int | None = None,
     ) -> dict[str, Any]:
         return await tool_watch_meters(
@@ -2549,7 +2695,7 @@ def build_server(ctx: ServerContext) -> Any:
         ),
     )
     async def uad_snapshot(
-        action: str = "list",
+        action: Literal["save", "list", "diff", "restore"] = "list",
         name: str | None = None,
         dry_run: bool = True,
         ignore: list[str] | None = None,

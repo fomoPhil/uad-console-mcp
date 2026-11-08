@@ -689,3 +689,11 @@ async def test_client_writes_nothing_to_stdout(capsys: pytest.CaptureFixture[str
         await client.subscribe(IN8_MUTE, lambda _value: None)
         await client.unsubscribe(IN8_MUTE)
     assert capsys.readouterr().out == ""
+
+
+def test_a_malformed_frame_is_dropped_without_losing_the_stream() -> None:
+    """Audit L1: one bad frame must not tear down the socket and fail every pending request."""
+    channel = UAClient()._control
+    good = b'{"path": "/Tempo", "data": 120}\0'
+    messages = channel._feed(b"{not json\0\xff\xfe\0" + good)
+    assert messages == [{"path": "/Tempo", "data": 120}]

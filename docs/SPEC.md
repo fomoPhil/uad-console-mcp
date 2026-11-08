@@ -230,7 +230,10 @@ Rules:
 - The write rate limiter is charged inside `check_write`, for refusals as well as allowed writes
   (the caller already spent a property read to get there) - but AFTER the readonly-mode and
   denylist checks, which are permanent: answering those with "retry in 0.1 s" would invite a
-  retry loop that can never succeed.
+  retry loop that can never succeed. `Mute` set true and `TalkbackOn` set false are never
+  charged: the bucket is empty exactly when the panic button is needed.
+- Every tool that can raise the monitor level runs under `ServerContext.monitor_lock`, because
+  MCP runs tool calls concurrently and the rolling budget is read-check-write-record.
 - Values clamped to the property's own min/max metadata; enums validated against `values`.
 - Global token-bucket rate limit: 10 writes/s, burst 20.
 - 48V writes require `confirm_condenser_mic=True` flowing in from the tool layer via `context`.

@@ -41,6 +41,7 @@ from uad_console_mcp.safety import (  # noqa: E402
     SafetyGate,
     SafetyRefusal,
     WriteContext,
+    canonical_path,
     coerces_to_false,
     gate_from_env,
     mode_from_env,
@@ -311,6 +312,31 @@ def test_pluginscenes_writes_are_refused_in_every_mode(mode: Mode) -> None:
     message = str(excinfo.value)
     assert "/pluginscenes" in message
     assert_names_remedy(message)
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize(
+    "path",
+    [
+        "//pluginscenes/0/Name",
+        "/PluginScenes/0/Name",
+        "/devices/0/multiunitorder",
+        "/devices/0/APPCOMMAND",
+        f"{MONITOR}/CRMonitorLevelTapered",
+        f"{MONITOR}/SurroundTrimLevel",
+    ],
+)
+def test_denylist_survives_other_spellings(mode: Mode, path: str) -> None:
+    """Audit H5: whether the engine resolves these spellings is unknown; the gate must not care."""
+    with pytest.raises(SafetyRefusal) as excinfo:
+        gate(mode).check_write(prop(path, "float", 0.0), 1.0, context="probe")
+    assert_names_remedy(str(excinfo.value))
+
+
+def test_canonical_path_strips_value_and_empty_segments() -> None:
+    assert canonical_path("//devices/0//outputs/22/Mute/value/") == "/devices/0/outputs/22/Mute"
+    with pytest.raises(ValueError):
+        canonical_path("/devices/../pluginscenes")
 
 
 def test_engine_readonly_flag_is_honoured_even_in_full_mode() -> None:
@@ -681,6 +707,23 @@ def test_refused_writes_spend_a_token_too() -> None:
     with pytest.raises(SafetyRefusal) as refilled:
         barrier.check_write(off_allowlist, True, context="refilled")
     assert "not in the safe-mode allowlist" in str(refilled.value)
+
+
+def test_quieting_writes_are_never_rate_limited() -> None:
+    """Audit H2: an empty bucket is exactly when the panic button has to work."""
+    barrier = gate("safe", write_burst=1, clock=FakeClock())
+    barrier.check_write(fader(), -6.0, context="spends the only token")
+    with pytest.raises(SafetyRefusal, match="rate limit"):
+        barrier.check_write(fader(), -6.0, context="empty")
+    mute = prop(f"{INPUT}/Mute", "bool", False)
+    talkback = prop("/TalkbackOn", "bool", True)
+    for _ in range(20):
+        assert barrier.check_write(mute, True, context="panic") is True
+        assert barrier.check_write(talkback, False, context="panic") is False
+    with pytest.raises(SafetyRefusal, match="rate limit"):
+        barrier.check_write(mute, False, context="an unmute is not exempt")
+    with pytest.raises(SafetyRefusal, match="rate limit"):
+        barrier.check_write(talkback, True, context="talkback on is not exempt")
 
 
 def test_readonly_mode_never_degrades_into_a_rate_limit_message() -> None:

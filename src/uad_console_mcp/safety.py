@@ -119,6 +119,12 @@ DENIED_PROPERTIES = frozenset(
 )
 DENIED_PROPERTY_SUBSTRINGS = ("firmware", "bootloader", "serialnumber", "hwid")
 DENIED_PATH_PREFIXES = ("/pluginscenes",)
+MONITOR_BYPASS_PROPERTIES = frozenset({"CRMonitorLevelTapered", "SurroundTrimLevel"})
+"""Other ways to move the monitor level. The rail only understands ``CRMonitorLevel`` in dB, so
+these are refused in every mode rather than left as a way around it."""
+
+_DENIED_FOLDED = frozenset(name.casefold() for name in DENIED_PROPERTIES)
+_MONITOR_BYPASS_FOLDED = frozenset(name.casefold() for name in MONITOR_BYPASS_PROPERTIES)
 
 _MODE_REMEDY = f"Set {ENV_MODE}=safe (or full) to allow writes at all."
 _FULL_REMEDY = f"Set {ENV_MODE}=full to bypass the safe-mode allowlist."
@@ -288,6 +294,20 @@ def gate_from_env(env: Mapping[str, str] | None = None) -> SafetyGate:
 # ------------------------------------------------------------------------- small utilities
 
 
+def canonical_path(path: str) -> str:
+    """``path`` with empty segments and a trailing ``/value`` removed. Refuses ``.`` and ``..``.
+
+    The gate matches prefixes and names textually, so ``//pluginscenes`` or ``.../Mute/value``
+    must not reach it in a spelling it does not recognise.
+    """
+    parts = [part for part in str(path).split("/") if part]
+    if any(part in (".", "..") for part in parts):
+        raise ValueError(f"{path!r} contains '.' or '..'; pass a plain engine path.")
+    if len(parts) > 1 and parts[-1] == "value":
+        parts.pop()
+    return "/" + "/".join(parts)
+
+
 def property_name(path: str) -> str:
     """Last path segment, tolerating a trailing ``/value``."""
     parts = [part for part in path.split("/") if part]
@@ -313,6 +333,13 @@ def coerces_to_false(value: Any) -> bool:
     return isinstance(value, str) and value.strip().casefold() in _FALSY
 
 
+def _only_quieter(name: str, value: Any) -> bool:
+    """``Mute`` switched on, or ``TalkbackOn`` switched off: writes that cannot add level."""
+    if name == "Mute":
+        return value is True or (isinstance(value, str) and value.strip().casefold() in _TRUTHY)
+    return name == "TalkbackOn" and coerces_to_false(value)
+
+
 def _refuse(reason: str, remedy: str) -> NoReturn:
     message = f"{reason} {remedy}"
     logger.warning("refused: %s", message)
@@ -321,11 +348,17 @@ def _refuse(reason: str, remedy: str) -> NoReturn:
 
 def _denial_reason(name: str, path: str) -> str | None:
     folded = name.casefold()
+    folded_path = "/" + "/".join(part for part in path.casefold().split("/") if part)
     for prefix in DENIED_PATH_PREFIXES:
-        if path.startswith(prefix):
+        if folded_path == prefix or folded_path.startswith(prefix + "/"):
             return f"{prefix} is never writable through this server."
-    if name in DENIED_PROPERTIES:
+    if folded in _DENIED_FOLDED:
         return f"{name!r} is on the permanent denylist (device identity / engine internals)."
+    if folded in _MONITOR_BYPASS_FOLDED:
+        return (
+            f"{name!r} moves the monitor level outside the monitor rail. Set "
+            f"{MONITOR_LEVEL_PROPERTY} in dB with uad_set_monitor(level_db=...) instead."
+        )
     for needle in DENIED_PROPERTY_SUBSTRINGS:
         if needle in folded:
             return f"{name!r} looks like a firmware or hardware-identity property."
@@ -482,8 +515,12 @@ class SafetyGate:
             _refuse(f"Refused write to {path}{because}: {denial}", _NO_UNBLOCK)
 
         # Everything below this line costs a token whether it is allowed or refused: the caller
-        # already spent a property read to get here, so refusals must not be free.
-        self._consume_token(path)
+        # already spent a property read to get here, so refusals must not be free. The one
+        # exception is a write that can only make things quieter (a mute, talkback off): the
+        # bucket is empty exactly when an agent has run away, which is when the panic button
+        # must still work.
+        if not _only_quieter(name, new_value):
+            self._consume_token(path)
 
         if getattr(prop, "readonly", False) and not self._allow_readonly_writes:
             _refuse(

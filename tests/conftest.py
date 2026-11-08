@@ -25,6 +25,14 @@ from tests.mock_engine import MockEngine  # noqa: E402
 MockFactory = Callable[..., Awaitable[MockEngine]]
 
 
+@pytest.fixture(autouse=True)
+def rig_profile_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the rig profile at a tmp file, so no test reads or writes the real one."""
+    path = tmp_path / "rig-profile.json"
+    monkeypatch.setenv("UAD_MCP_RIG_PROFILE", str(path))
+    return path
+
+
 @pytest.fixture(scope="session")
 def base_fixture() -> dict[str, Any]:
     """The captured Apollo x8 Gen 2 tree, loaded once per session.

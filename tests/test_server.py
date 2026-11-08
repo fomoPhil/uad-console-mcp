@@ -118,7 +118,17 @@ async def test_get_status_golden_shape(mock: MockEngine) -> None:
     async with context(mock) as ctx:
         result = await srv.tool_get_status(ctx)
 
-    assert set(result) == {"ok", "engine", "clock", "dsp", "talkback", "devices", "safety"}
+    assert set(result) == {
+        "ok",
+        "engine",
+        "clock",
+        "dsp",
+        "talkback",
+        "devices",
+        "safety",
+        "rig_profile",
+    }
+    assert result["rig_profile"]["saved"] is False
     assert result["ok"] is True
     assert set(result["engine"]) == {
         "connected",
@@ -2022,7 +2032,7 @@ async def test_a_tool_that_raises_becomes_a_sentence(mock: MockEngine) -> None:
 
 @pytest.mark.parametrize(
     ("mode", "expected"),
-    [("readonly", 21), ("safe", 21), ("full", 22)],
+    [("readonly", 25), ("safe", 25), ("full", 26)],
 )
 async def test_raw_set_is_registered_only_in_full_mode(
     mock: MockEngine, mode: str, expected: int
@@ -2054,12 +2064,19 @@ async def test_resources_and_prompts_are_registered(mock: MockEngine) -> None:
         prompts = [prompt.name for prompt in await server.list_prompts()]
         limitations = await server.read_resource("uad://limitations")
         state = await server.read_resource("uad://state")
-    assert resources == ["uad://state", "uad://channels", "uad://limitations"]
+    assert resources == [
+        "uad://state",
+        "uad://channels",
+        "uad://limitations",
+        "uad://rig-profile",
+    ]
     assert prompts == [
         "setup_vocal_tracking",
         "onboard_adat_expander",
         "troubleshoot_clock",
         "panic_reset",
+        "setup_livestream",
+        "rig_profile_interview",
     ]
     assert "Headphone output level cannot be set" in str(limitations[0].content)
     assert '"sample_rate": 48000' in str(state[0].content)

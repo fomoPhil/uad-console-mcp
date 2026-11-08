@@ -13,8 +13,13 @@ Start every session with:
 
 ```
 uad_get_status()
+uad_rig_profile()                 # what is plugged in where; empty means ask, then save it
 uad_list_channels(kind="input")
 ```
+
+When the user names a job ("I want to stream", "I'm tracking", "I'm mixing now"), reach for
+`uad_mode` first: `action="plan"`, show the plan, `action="apply"` with the same arguments on a
+yes. Do the task by hand only when no mode fits.
 
 If `safety.mode` is `readonly`, say so up front: nothing can be changed. Exact tool and parameter
 names for everything below are in `references/tools.md`.
@@ -153,41 +158,38 @@ More patterns, including talkback and drummer-in-the-live-room setups:
 
 ## Task: podcast or livestream
 
-Multiple mics, per-mic processing, and computer audio coming back in. Full walkthrough with a
-two-host and a remote-guest layout: `references/podcast-streaming.md`.
+Mic(s) plus computer audio, recorded by a stream or call app. Full walkthrough, including the
+I/O Matrix and a remote guest: `references/podcast-streaming.md`.
 
-Skeleton:
-
-```
-uad_list_channels(kind="input")
-uad_set_channels(items=[
-  {"target": 1, "name": "HOST",  "fader_db": 0, "mute": false, "hidden": false},
-  {"target": 2, "name": "GUEST", "fader_db": 0, "mute": false, "hidden": false}
-])
-uad_set_preamp(target="HOST",  source="Mic", gain_db=30, low_cut=true)
-uad_set_preamp(target="GUEST", source="Mic", gain_db=30, low_cut=true)
-uad_watch_meters(targets=["HOST","GUEST"], duration_s=15, threshold_db=-6)
-uad_load_plugin(target="HOST",  plugin="<a compressor>", slot=0)
-uad_load_plugin(target="GUEST", plugin="<a compressor>", slot=0)
-uad_set_sends(items=[
-  {"target": "HOST",  "send": "cue1", "level_db": -8},
-  {"target": "GUEST", "send": "cue1", "level_db": -8}
-])
-uad_snapshot(action="save", name="podcast-2mic")
-```
-
-**Computer audio** (a remote guest on a call, music beds, video playback) arrives on channels whose
-`io_type` is `Virtual`. Find them by that flag, name them, and send them into the cue buses so the
-hosts can hear the remote guest:
+The Apollo does loopback by itself: computer audio plays into a `Virtual` strip, Console mixes it
+with the mics and their UAD plugins, and the driver offers that monitor mix back as the inputs
+`MON L/R`. The stream app records those.
 
 ```
-uad_set_channels(items=[{"target": "<virtual channel index>", "name": "REMOTE", "hidden": false}])
-uad_set_sends(items=[{"target": "REMOTE", "send": "cue1", "level_db": -10}])
+uad_mode(action="plan", mode="livestream")                 # mics and system audio from the profile
+uad_mode(action="plan", mode="livestream", inputs=["HOST", "GUEST"], system_audio="VIRTUAL 1")
+uad_mode(action="apply", mode="livestream", ...)           # same arguments, after a yes
+uad_get_routing()                                          # exact channel numbers for the apps
+uad_watch_meters(targets=["HOST", "GUEST", "VIRTUAL 1"], duration_s=10)
 ```
 
-Which application feeds which virtual channel is set in Console and in the operating system's
-audio settings. **The routing matrix is not writable here**, so hand that step to the user and
-verify the result with `uad_peek_meters`.
+Relay every `warnings` entry, and walk the user through each `you_do` step, waiting for them:
+those are macOS and app settings this server cannot reach (Audio MIDI Setup > Configure
+Speakers for computer audio, the stream app's input, the I/O Matrix if the app only reads inputs
+1-2). Gain staging and per-mic processing work exactly as in tracking:
+
+```
+uad_set_preamp(target="HOST", source="Mic", gain_db=30, low_cut=true)
+uad_load_plugin(target="HOST", plugin="<a compressor>", slot=0)
+```
+
+**A remote guest must never hear themselves.** Pass `guest=` (the strip the call app plays into,
+on its own virtual pair) and the mode builds a mix-minus on `aux2`. If the guest and the computer
+audio share a strip, the plan asks instead of applying.
+
+**Feedback paths:** open mics with the monitors up, and any app whose output goes to the Apollo's
+virtual channels while it also records MON L/R. Headphones for the hosts; `uad_safe_state()` if it
+squeals.
 
 ## Task: troubleshooting
 
@@ -261,6 +263,7 @@ uad_snapshot(action="restore", name="before-experiment", dry_run=false)  # only 
 - `references/gain-staging.md`: gain method, meter targets, reading `uad_peek_meters` and
   `uad_watch_meters` output, per-source starting points.
 - `references/cue-mixes.md`: cue bus patterns for several performers, talkback, mono questions.
-- `references/podcast-streaming.md`: multi-mic podcast and stream layouts, virtual channels.
+- `references/podcast-streaming.md`: livestream and podcast layouts, loopback, the I/O Matrix,
+  virtual channels and a guest mix-minus.
 - `references/troubleshooting.md`: the full decision trees, including clock faults and missing
   channels.

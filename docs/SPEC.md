@@ -266,7 +266,7 @@ Rules:
 
 ### 4.5 `server.py` + `__main__.py`
 
-Tool surface (~19 tools):
+Tool surface (25 tools, 26 in `full` mode):
 
 | Tool | Purpose |
 |---|---|
@@ -291,6 +291,10 @@ Tool surface (~19 tools):
 | uad_watch_meters | poll up to `duration_s` (cap 30), early-exit when any watched channel exceeds `threshold_db`; returns per-channel peaks |
 | uad_snapshot | action=save/list/diff/restore; restore defaults dry_run=true; ignore globs for diff |
 | uad_raw_get | raw read of any path; raw set ONLY in `full` mode (separate uad_raw_set registered only when mode=full) |
+| uad_get_routing | read-only driver I/O map (§4.10): channel numbers apps see, MON/AUX loopback inputs, virtual outputs, I/O Matrix preset |
+| uad_get_mix | read-only view of one aux or cue bus: sources and levels, what is off, where the bus goes |
+| uad_rig_profile | get/save the user's rig profile (§4.8); local file, no engine writes |
+| uad_mode | list/plan/apply a workflow mode (§4.9); plan is the default and writes nothing |
 
 - `FastMCP("uad-console")`, stdio transport:
   all `uad_`-prefixed, batch setters accept lists, every write result is
@@ -299,9 +303,10 @@ Tool surface (~19 tools):
   "Use when:" and one "Not for:" line (e.g. set_monitor: "Not for headphone level: the
   protocol cannot set it; see uad://limitations").
 - Resources: `uad://state` (get_status payload), `uad://channels`, `uad://limitations`
-  (the cannot-do list + workarounds).
+  (the cannot-do list + workarounds), `uad://rig-profile`.
 - Prompts: `setup_vocal_tracking`, `onboard_adat_expander`, `troubleshoot_clock`,
-  `panic_reset`. Mirrored prose lives in docs/RECIPES.md.
+  `panic_reset`, `setup_livestream`, `rig_profile_interview`. Mirrored prose lives in
+  docs/RECIPES.md.
 - Errors surfaced to the LLM must be actionable sentences, never tracebacks. Connection
   failure text: "UA Mixer Engine not reachable on 127.0.0.1:4710 - is the UAD software
   installed and running? (It starts with UAD Console and keeps running afterwards.)"
@@ -309,6 +314,58 @@ Tool surface (~19 tools):
   devices + online states, safety mode + effective limits, sample rate/clock, plugin count);
   `--dump-tree [FILE]`: fixture-format walk (sanitizes the home directory out of string
   values); `--version`.
+
+### 4.8 `profile.py` (rig profile)
+
+- File: `UAD_MCP_RIG_PROFILE`, default `~/.uad-console-mcp/rig-profile.json`. A missing file is an
+  empty profile, never an error. Doc: `{schema_version: 1, updated, device_types, sources: [...],
+  notes}`; each source `{device, index, name, plugged_in?, mic_type?, role?, notes?}`.
+- Sources are keyed by `(device, index)`, never by name: modes and users rename strips. `name` is
+  the name at save time, for humans only.
+- `save` validates every item against the live rig, all or nothing: unknown keys, duplicate
+  inputs, enum values (`mic_type` in dynamic/condenser/ribbon/line/unknown, `role` in
+  voice/instrument/system_audio/call_guest/other), and a mic type on a strip with no preamp are
+  refused. `sources` replaces the list; `notes` alone keeps it.
+- Saving is allowed in every safety mode: it writes a local file, nothing on the engine.
+- RULE: `uad_set_preamp` refuses 48V ON (`not coerces_to_false(value)`) on an input the profile
+  marks `ribbon`, whatever `confirm_condenser_mic` says, and fails closed when the profile cannot
+  be read. Switching 48V off is never blocked. Snapshot restores cannot switch 48V on at all (the
+  gate refuses them without `confirm_condenser_mic`).
+
+### 4.9 `modes.py` (workflow modes)
+
+- Pure planner. `select()` resolves which strips a mode acts on: explicit arguments, then the
+  profile roles, then a safe default (system audio only: the first Virtual input, with a note).
+  A microphone is never defaulted: no argument and no profile role is a `question`.
+- `plan()` returns `{summary, channels, sends, warnings, you_do, check, notes, questions, writes}`.
+  `channels` and `sends` are ordinary `uad_set_channels` / `uad_set_sends` items containing only
+  fields whose live value differs.
+- Rules: a fader or send is moved only when at or below -60 dB (voice 0 dB, computer audio -10 dB,
+  cue -6 dB); modes never write output strips, the monitor, 48V, gain, clock, sample rate or the
+  I/O Matrix; stray solos are cleared by `livestream`, `tracking` and `mixing`.
+- `livestream` with a guest: mix-minus on `aux2` (or `aux1`): voice and system audio sends on,
+  guest send at -144, the aux return muted. Guest == another chosen strip is a question.
+- `mixing` mutes every input whose `io_type` is not `Virtual`, `TalkbackMic` or absent.
+- `server.tool_mode` apply: refuse on questions, refuse in `readonly`, do nothing (and save no
+  snapshot) when `writes == 0`, otherwise save `pre-mode-<mode>-<UTC ts>` first and then call
+  `tool_set_channels` and `tool_set_sends`, so every write meets the same gate, rate limit and
+  read-back as a direct call. `tool_mode` must not hold `monitor_lock` itself (asyncio locks are
+  not re-entrant and `tool_set_channels` takes it).
+
+### 4.10 `routing.py` (driver I/O map)
+
+- `/inputroutes/N` and `/outputroutes/N`, numerically ordered, are the driver channels in the
+  order apps number them: route 0 is channel 1. Each has `Name`, `IOType`, `ChannelIndex` (index
+  within its IOType, 1-based) and read-only `Active` (false = disabled in the I/O Matrix).
+- Loopback inputs: `IOType CtrlRoom` 1-2 = `MON L/R` (Console monitor mix); `IOType Aux`
+  1-2 = `AUX1 L/R`, 3-4 = `AUX2 L/R`. A `Virtual` strip's ordinal among Virtual inputs matches the
+  `ChannelIndex` of the `Virtual` output route that plays into it. `Cue` output routes 2n-1, 2n
+  play into cue n.
+- `/IOMapPreset` (enum of I/O Matrix presets, including `Livestreaming` on the x8 Gen 2) is read
+  only. Nothing in this module or the server writes routes or presets.
+- UNVERIFIED on hardware: whether `AUX n L/R` capture is taken before or after the aux return mute
+  and fader, and whether `MON L/R` capture follows the monitor level or mute. Modes say so and
+  give the user a check instead of asserting either.
 
 ### 4.6 `tests/mock_engine.py`
 

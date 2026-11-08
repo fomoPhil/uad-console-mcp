@@ -36,7 +36,8 @@ reporting a success.
 
 ## Read a send before you write it
 
-There is no send-read tool, so read the nodes directly:
+`uad_get_mix(bus="cue1")` shows every strip in a cue with its level, what is off, and which
+headphone output plays it (`heard_on`). For one send's full metadata, read the nodes directly:
 
 ```
 uad_raw_get(path="/devices/0/inputs/0/sends")

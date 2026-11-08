@@ -1,9 +1,9 @@
 # Recipes
 
-The server ships four prompts. If your MCP client exposes prompts (Claude Desktop and Claude Code
+The server ships six prompts. If your MCP client exposes prompts (Claude Desktop and Claude Code
 both do), you can invoke them by name and the model gets the full instruction text. This file is
-the human-readable version of the same four, plus a gain-staging guide and a worked ADAT expander
-walkthrough.
+the human-readable version of the same six, plus the livestream-with-a-guest and job-switching
+recipes, a gain-staging guide and a worked ADAT expander walkthrough.
 
 | Prompt | Use it when |
 |---|---|
@@ -11,6 +11,8 @@ walkthrough.
 | `onboard_adat_expander` | Adding an 8-channel ADAT expander or a second interface in ADAT mode |
 | `troubleshoot_clock` | A digital input reads nothing, or the clock will not lock |
 | `panic_reset` | Feedback, a runaway level, anything unexpectedly loud |
+| `rig_profile_interview` | The first session: tell the agent your gear once |
+| `setup_livestream` | Streaming your mic plus your computer's audio |
 
 A note that applies to all of them: every write this server makes is read back and reported as
 `verified`. If a model tells you it changed something, ask it what the read-back said.
@@ -169,6 +171,105 @@ Something is wrong right now. Get safe first, diagnose second.
 
 Do not, while sorting this out: raise the monitor level to hear whether it is fixed, unsolo or
 unmute everything at once, change the clock source or sample rate, or engage 48V.
+
+---
+
+## 5. Tell the agent your rig once
+
+The engine knows which strips exist. It does not know that an SM7B is on input 1, that input 2 is
+a ribbon, or that your computer plays to VIRTUAL 1. Without that, every session starts with
+questions, and 48V is one confident guess away from a dead ribbon.
+
+1. Run the `rig_profile_interview` prompt, or just say "learn my setup".
+2. The agent lists your inputs and asks, a few at a time: what is plugged in, what kind of source
+   it is (dynamic, condenser, ribbon or line), which one is your voice, where computer audio plays,
+   and what gear sits around the Apollo (expander, monitors, headphones, DAW, stream app).
+3. It shows you the profile, then saves it with `uad_rig_profile(action="save", ...)`. It is a
+   file on your Mac (`~/.uad-console-mcp/rig-profile.json`). Nothing is written to the Apollo.
+
+What it changes: any input marked `ribbon` refuses 48V, even if the agent confirms a condenser,
+until you update the profile. And `uad_mode` uses your roles as its defaults, so "set me up to
+stream" just works.
+
+---
+
+## 6. Livestream your mic plus computer audio
+
+The Apollo does this without extra software. Computer audio plays into a **Virtual** channel, so
+it shows up as a Console strip next to your mic. Console mixes the two, with your UAD plugins on
+the mic. The driver then offers that mix back to your Mac as two more inputs, **MON L/R**. Your
+stream app records those.
+
+```
+macOS audio ──> VIRTUAL 1/2 strip ─┐
+                                   ├─> Console monitor mix ──> MON L/R inputs ──> OBS / stream app
+mic ──> ANALOG 1 (+ UAD plugins) ──┘                       └─> your headphones and monitors
+```
+
+1. `uad_get_status` and `uad_rig_profile()`. No profile? Do recipe 5 first, or name the mic.
+2. `uad_mode(action="plan", mode="livestream")`. Read the summary and the warnings. It opens the
+   mic and the computer-audio strip if they are muted or down, clears any solo (a solo would leave
+   the stream with only one strip), and leaves faders that are already up where they are.
+3. Say yes, and the agent runs it with `action="apply"`. It saves a snapshot first; restoring that
+   snapshot undoes everything the mode changed.
+4. The steps only you can do, which the plan spells out with your exact channel numbers:
+   - **Computer audio to VIRTUAL 1/2.** Audio MIDI Setup > select the Apollo > Configure Speakers
+     > Stereo: left and right to the VIRTUAL 1 and VIRTUAL 2 channels (21 and 22 on an x8). Then
+     choose the Apollo in System Settings > Sound > Output.
+   - **The stream app's input.** Pick the Apollo, inputs MON L/R (27-28 on an x8). If the app only
+     uses inputs 1-2, which most do, move MON L/R to inputs 1-2 in UAD Console > Settings > I/O
+     Matrix. There is a `Livestreaming` preset there. Your DAW's input numbers move while it is
+     selected, so switch back for a recording session. `uad_get_routing` confirms where MON L/R
+     ended up.
+   - **No loop.** Do not set the stream app's monitoring output to the Apollo's virtual channels.
+     The stream would play back into its own input.
+5. Check: talk and play something while the agent runs `uad_watch_meters` on the mic and the
+   computer-audio strip, watch the stream app's meter, and make a short test recording.
+
+Monitors on with an open mic can feed back. Headphones are the safe setup. The mode warns about it
+and never touches the monitor itself.
+
+---
+
+## 7. Livestream with a call guest (mix-minus)
+
+A guest on Zoom, Discord or Riverside has to hear you and the computer audio, but not themselves,
+or they get their own voice back half a second late. That needs a separate mix for the call: a
+**mix-minus**.
+
+1. Give the call app **its own virtual pair**, for example VIRTUAL 3/4. They may be disabled in
+   the I/O Matrix; `uad_get_routing` says so, and Console > Settings > I/O Matrix turns them on.
+2. `uad_mode(action="plan", mode="livestream", guest="VIRTUAL 3")` (or save role `call_guest` in
+   the profile). The plan sends your mic and the computer audio to `aux2`, keeps the guest out of
+   it, and mutes the aux2 return so the call mix is not added to your monitor mix a second time.
+3. The call app's microphone is the Apollo's AUX2 L/R inputs (31-32 on an x8). Its speaker is the
+   guest's virtual pair. The stream app keeps recording MON L/R, which has everyone.
+4. The catch: most call apps only use channels 1-2 of a device, and they cannot pick AUX2 L/R or
+   VIRTUAL 3/4 by themselves. Put a channel router in between (Rogue Amoeba Loopback, or BlackHole
+   with an aggregate device), or run the call through a DAW.
+5. Check with the guest: they should hear you and the music, and no echo of themselves. If they
+   hear nothing from you at all, the AUX capture on your setup follows the aux return: unmute the
+   aux2 return (`uad_set_channels(items=[{"target": "AUX 2", "kind": "aux", "mute": false}])`) and
+   accept that the call mix also plays in your monitors. (Whether AUX L/R is taken before or after
+   the return mute is not verified on hardware yet.)
+
+---
+
+## 8. Switch jobs, and switch back
+
+| Say | Mode | What it does |
+|---|---|---|
+| "I'm going live" | `livestream` | Recipe 6 |
+| "I'm recording a vocal / guitar" | `tracking` | Opens that input, sends it to `cue1` at -6 dB if it was off there, clears stray solos, tells you which headphone output plays `cue1` and which DAW outputs feed it. Gain and 48V stay with you |
+| "I'm mixing now" | `mixing` | Mutes every hardware input in the Console mix (mics, line, ADAT, S/PDIF) and clears solos, so expander hiss and room mics stay out of the monitors. Virtual inputs stay open. Console mutes do not stop the DAW recording those inputs |
+
+Every apply saves `pre-mode-<mode>-<time>`. To go back:
+`uad_snapshot(action="restore", name="pre-mode-mixing-...")` shows the dry run, and
+`dry_run=false` runs it. For a setup you want to recall by name ("Friday stream"), apply the mode,
+adjust to taste, then `uad_snapshot(action="save", name="friday-stream")`.
+
+What no mode ever does: raise or unmute the monitor, switch 48V, gain, pad or phase, change the
+clock, sample rate or I/O Matrix, or move a fader or send that is already up.
 
 ---
 

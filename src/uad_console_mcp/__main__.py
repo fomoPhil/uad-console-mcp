@@ -26,9 +26,10 @@ from typing import Any
 
 import anyio
 
-from . import __version__
+from . import __version__, routing
 from .client import DEFAULT_HOST, DEFAULT_PORT, UAClient, UAError
 from .discovery import discover
+from .profile import ProfileError, ProfileStore
 from .safety import DENIED_PROPERTY_SUBSTRINGS, ENV_MODE, gate_from_env
 from .server import CONNECT_HELP, ServerContext, build_server
 
@@ -210,6 +211,34 @@ async def doctor(client: UAClient) -> tuple[int, list[str]]:
         lines.append(f"plugins:       {len(plugins)} installed")
     except UAError as exc:
         lines.append(f"plugins:       could not read the catalog: {exc}")
+
+    try:
+        _, routes = await client.get_node("/inputroutes")
+        fields = ("Name", "IOType", "ChannelIndex", "Active")
+        values = await client.poll_values(
+            [f"/inputroutes/{child}/{field}" for child in routes for field in fields]
+        )
+        mix = routing.capture(routing.route_entries(routes, values, "/inputroutes"), "monitor_mix")
+        lines.append(
+            "stream input:  "
+            + (
+                f"Console monitor mix (MON L/R) on driver inputs {mix['channels'][0]}-"
+                f"{mix['channels'][-1]}"
+                if mix
+                else "no MON L/R driver inputs found"
+            )
+        )
+    except UAError as exc:
+        lines.append(f"stream input:  could not read the I/O map: {exc}")
+
+    store = ProfileStore()
+    if not store.exists:
+        lines.append(f"rig profile:   none saved yet ({store.path})")
+    else:
+        try:
+            lines.append(f"rig profile:   {len(store.load().sources)} source(s) in {store.path}")
+        except ProfileError as exc:
+            lines.append(f"rig profile:   {exc}")
 
     lines.append(f"safety mode:   {limits['mode']} (from {limits['mode_env_var']})")
     lines.append(

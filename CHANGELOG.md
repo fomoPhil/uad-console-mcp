@@ -9,7 +9,7 @@ First public MCP server for UAD Console / the UA Mixer Engine.
 
 ### Added
 
-- **Tools: 21 in `readonly` and `safe` mode, 22 in `full` mode.** Status and channel listing
+- **Tools: 25 in `readonly` and `safe` mode, 26 in `full` mode.** Status and channel listing
   (`uad_get_status`, `uad_list_channels`), channel state (`uad_set_channels`), preamps
   (`uad_set_preamp`), aux and cue sends (`uad_set_sends`), control room (`uad_set_monitor`,
   `uad_talkback`, `uad_safe_state`), transport (`uad_set_clock`, `uad_set_sample_rate`), UAD
@@ -65,7 +65,7 @@ First public MCP server for UAD Console / the UA Mixer Engine.
 - **Documentation**: `README.md`, `AGENTS.md` (rules and canonical flows for LLM callers),
   `docs/PROTOCOL.md` (wire protocol cheatsheet), `docs/RECIPES.md`, and `docs/SPEC.md` (module
   contracts).
-- **543 tests** against `tests/mock_engine.py`, covering framing edge cases (split frames,
+- **572 tests** against `tests/mock_engine.py`, covering framing edge cases (split frames,
   batched frames, meter noise, abrupt disconnects, unanswered paths), reply interleaving,
   serialized writes under concurrency, reconnect and rediscovery, `readonly` mode reaching the
   wire zero times, the monitor rail as a property test, snapshot round-trips on a cascade fixture,
@@ -90,6 +90,32 @@ First public MCP server for UAD Console / the UA Mixer Engine.
   sample-rate write is `ok: false`; `auto_off_s` must be above 0.
 - A malformed engine frame is dropped instead of the whole socket. `mcp` is pinned below 3.
 
+### Added (workflow audit, see `docs/audit-2026-11-workflows.md`)
+
+- **`uad_mode`**: one call per job. `livestream` (mic plus computer audio into the monitor mix a
+  stream app records from `MON L/R`, with an optional call guest on an aux mix-minus), `tracking`
+  (open an input and put it in a headphone cue), `mixing` (mute every hardware input). Plan is the
+  default and writes nothing; apply saves a `pre-mode-*` snapshot and writes through
+  `uad_set_channels` and `uad_set_sends`. Modes never touch the monitor, 48V, gain, clock, sample
+  rate or I/O Matrix, and never move a fader or send that is already up.
+- **`uad_rig_profile`** and `uad://rig-profile`: the user's own description of the rig (what is
+  plugged in where, mic type, role, notes) in `~/.uad-console-mcp/rig-profile.json`
+  (`UAD_MCP_RIG_PROFILE`). Keyed by device and index so renames do not lose it. `uad_get_status`
+  says whether one is saved.
+- **Ribbon guard**: 48V is refused on an input the profile marks `ribbon`, even with
+  `confirm_condenser_mic=true`, and refused when the profile cannot be read.
+- **`uad_get_routing`**: the driver I/O map with the channel numbers apps see, where the
+  `MON L/R` and `AUX1/AUX2 L/R` loopback inputs land, which virtual outputs are enabled, and the
+  I/O Matrix preset. Read-only.
+- **`uad_get_mix`**: one aux or cue bus, with every source's send level, what is off, which
+  headphone output plays a cue, and an aux's return, plugins and capture inputs. Read-only. This
+  replaces reading sends one node at a time with `uad_raw_get`.
+- **Prompts** `setup_livestream` and `rig_profile_interview`; recipes 5 to 8 in
+  `docs/RECIPES.md` (rig profile, livestream, call guest mix-minus, switching jobs).
+- `--check` reports where the monitor-mix loopback inputs are and whether a rig profile is saved.
+- The server's MCP instructions tell agents to read the rig profile first and to plan a mode
+  before applying it.
+
 ### Verified scope
 
 - Live-tested against an Apollo x8 Gen 2 (Thunderbolt, macOS, UA Mixer Engine, UAD 11.7.1).
@@ -102,6 +128,8 @@ First public MCP server for UAD Console / the UA Mixer Engine.
 
 Headphone output level cannot be set (no such property exists; use cue-bus send levels).
 Console sessions and plugin scenes cannot be saved or recalled. The I/O routing matrix is
-readable but not writable. No Dante support, no networked or remote engines, and only TCP 4710
+readable (`uad_get_routing`) but not writable, and which app plays to which channel is set in
+macOS. Whether the driver's AUX capture comes before or after the aux return mute is unverified
+on hardware. No Dante support, no networked or remote engines, and only TCP 4710
 is implemented. Meters are polled at about 3 Hz and a meter at the floor cannot distinguish a
 silent source from a dead digital link. Full list in `uad://limitations` and the README.

@@ -1,18 +1,65 @@
 # Podcast and livestream setups
 
-Two things make these different from music tracking: several open microphones in one room, and
-computer audio that has to come back into the Apollo and go out to the hosts without echoing back to
-a remote guest.
+Three things make these different from music tracking: computer audio has to come into the
+Console mix, the finished mix has to get back out to an app, and a remote guest must never hear
+themselves.
 
 ## Discover first
 
 ```
 uad_get_status()
+uad_rig_profile()
 uad_list_channels(kind="input")
+uad_get_routing()
 ```
 
-Note which inputs have `has_preamp: true` (the mics) and which have `io_type: "Virtual"` (computer
-audio). The number of virtual channels differs per model, so read them rather than assuming.
+Inputs with `has_preamp: true` are the mics. Inputs with `io_type: "Virtual"` are computer audio.
+`uad_get_routing` gives the channel numbers apps see. Every model differs, so read them.
+
+## How the Apollo does loopback
+
+No extra software is needed for the basic case.
+
+```
+macOS audio ──> VIRTUAL 1/2 strip ─┐
+                                   ├─> Console monitor mix ──> MON L/R driver inputs ──> stream app
+mics (+ UAD plugins) ──────────────┘                       └─> monitors and headphones
+```
+
+- **Computer audio in.** macOS plays to the Apollo's virtual outputs. Audio MIDI Setup > select
+  the Apollo > Configure Speakers > Stereo picks which pair system audio uses (VIRTUAL 1/2 is
+  channels 21-22 on an x8, per `uad_get_routing().virtual_outputs`). Then System Settings > Sound >
+  Output: the Apollo. The audio arrives on the matching `VIRTUAL` strip in Console.
+- **The mix out.** The driver inputs `MON L/R` carry the Console monitor mix (27-28 on an x8, per
+  `uad_get_routing().loopback.monitor_mix`). `AUX1 L/R` and `AUX2 L/R` carry the aux buses.
+- **Apps that only read inputs 1-2.** Zoom, browsers and most stream apps do. Then MON L/R must
+  move to inputs 1-2 in UAD Console > Settings > I/O Matrix (most Apollos list a `Livestreaming`
+  preset). That renumbers the DAW's inputs too, so switch back for recording sessions. After the
+  user changes it, `uad_get_routing().loopback.monitor_mix.channels == [1, 2]` confirms it.
+- **Disabled virtual channels.** The I/O Matrix can switch virtual channels off. They show
+  `active: false` in `uad_get_routing().virtual_outputs`, and nothing can play to them until the
+  user enables them in Console.
+
+None of the routing is writable by this server. Hand each step to the user with the exact channel
+numbers, wait, then prove it with meters.
+
+## Solo stream: one mic plus computer audio
+
+```
+uad_mode(action="plan", mode="livestream")       # defaults from the rig profile
+```
+
+The plan opens the mic and the computer-audio strip if they are muted or down (voice at 0 dB,
+computer audio at -10 dB, only when the fader was off), clears every solo (a solo leaves the stream
+with one strip), and lists:
+
+- `warnings`: monitors live with an open mic, 48V that disagrees with the profile, disabled
+  virtual channels. Relay each one.
+- `you_do`: Audio MIDI Setup, the stream app's input, the I/O Matrix if needed, and the rule
+  against looping the stream app's monitor output back into the Apollo.
+- `check`: the meter watch and a test recording.
+
+Apply with the same arguments on the user's yes. Keep the returned `snapshot` name to undo it.
 
 ## Two hosts in one room
 
@@ -23,6 +70,7 @@ uad_set_channels(items=[
 ])
 uad_set_preamp(target="HOST",  source="Mic", gain_db=30, low_cut=true)
 uad_set_preamp(target="GUEST", source="Mic", gain_db=30, low_cut=true)
+uad_mode(action="plan", mode="livestream", inputs=["HOST", "GUEST"])
 ```
 
 If either mic is a condenser, and only after the user confirms it:
@@ -47,6 +95,7 @@ before reaching for processing.
 ## Per-mic processing
 
 Speech benefits from a compressor first, then an EQ, on each mic separately rather than on a bus.
+Plugins on the strip are in the MON L/R mix, so the stream gets them.
 
 ```
 uad_list_plugins(search="compressor", authorized_only=true)
@@ -72,23 +121,35 @@ Then re-check gain, because Unison changes the gain relationship.
 exposed, so if a load starts failing, check the total and remove something with
 `uad_remove_plugin(target=..., slot=...)`.
 
-## Computer audio in and out
+## A remote guest: the mix-minus
 
-Computer audio (a remote guest on a call, music beds, video playback) reaches the Apollo on channels
-whose `io_type` is `Virtual`. Find them, name them, and treat them like any other source:
+The guest must hear the hosts and the music, never themselves. The call app therefore needs:
+
+- **its own strip**: the call app plays into its own virtual pair (for example VIRTUAL 3/4), not
+  the pair the rest of the computer audio uses;
+- **its own mix**: an aux bus with everything except that strip.
 
 ```
-uad_set_channels(items=[
-  {"target": "<virtual index>",     "name": "REMOTE",  "hidden": false, "fader_db": 0},
-  {"target": "<virtual index + 1>", "name": "MUSIC",   "hidden": false, "fader_db": -6}
-])
-uad_peek_meters(targets=["REMOTE","MUSIC"])
+uad_mode(action="plan", mode="livestream", guest="VIRTUAL 3")      # or role call_guest in the profile
+  -> sends: mics -> aux2 at 0 dB, computer audio -> aux2 at -10 dB (only if they were off),
+            the guest -> aux2 off
+  -> channels: the AUX 2 return muted, so the call mix is not added to the monitor mix twice
+  -> you_do: call app mic = AUX2 L/R (31-32 on an x8), call app speaker = the guest's pair
+uad_get_mix(bus="aux2")                                             # prove what the guest hears
 ```
 
-**Which application feeds which virtual channel is set in Console and in the operating system's
-audio settings, not here.** The routing matrix (`/inputroutes`, `/outputroutes`) can be inspected
-with `uad_raw_get` but cannot be re-patched by this server. Hand that step to the user, then prove it
-worked with `uad_peek_meters` while they play something.
+`bus="aux1"` uses the other aux. The plan warns if other strips also send to that aux or if a
+plugin (a reverb) is loaded on it. If the guest and the computer audio are the same strip, it
+asks instead of applying: the guest would hear themselves.
+
+The honest catch: most call apps use only channels 1-2 of a device, so they cannot pick AUX2 L/R
+or VIRTUAL 3/4 by themselves. That step needs a channel router (Rogue Amoeba Loopback, or
+BlackHole with an aggregate device) or a DAW in between. Say so plainly.
+
+Unverified on hardware: whether the driver's AUX capture is taken before or after the aux return
+mute. If the guest hears nothing at all from the hosts, unmute the return
+(`uad_set_channels(items=[{"target": "AUX 2", "kind": "aux", "mute": false}])`) and accept that the
+call mix also plays in the monitors. Test by asking the guest; they are the only real meter.
 
 ## Headphone feeds for the hosts
 
@@ -96,42 +157,28 @@ Each host hears the other hosts, the remote guest and the music, through a cue b
 
 ```
 uad_set_sends(items=[
-  {"target": "HOST",   "send": "cue1", "level_db": -8},
-  {"target": "GUEST",  "send": "cue1", "level_db": -8},
-  {"target": "REMOTE", "send": "cue1", "level_db": -10},
-  {"target": "MUSIC",  "send": "cue1", "level_db": -16},
-
-  {"target": "HOST",   "send": "cue2", "level_db": -8},
-  {"target": "GUEST",  "send": "cue2", "level_db": -8},
-  {"target": "REMOTE", "send": "cue2", "level_db": -10},
-  {"target": "MUSIC",  "send": "cue2", "level_db": -16}
+  {"target": "HOST",      "send": "cue1", "level_db": -8},
+  {"target": "GUEST",     "send": "cue1", "level_db": -8},
+  {"target": "VIRTUAL 3", "send": "cue1", "level_db": -10},
+  {"target": "VIRTUAL 1", "send": "cue1", "level_db": -16}
 ])
+uad_get_mix(bus="cue1")              # sources, levels, and which HP output plays cue1
 ```
 
 **The headphone output level itself cannot be set by this protocol.** Build the balance with these
 sends; the physical knob does the final trim.
 
-## Avoiding echo for the remote guest
+## Feedback paths
 
-A remote guest must not hear themselves come back. The mix sent to the call application must contain
-the local mics and the music, but **not** the `REMOTE` channel. That separation is made in the
-Console routing and in the call application's device selection, which this server cannot change.
-State the requirement clearly and let the user set it, then test by asking the guest whether they
-hear an echo.
-
-## Streaming: keep the control room out of the feedback loop
-
-Open mics plus speakers in the same room is a feedback path. For a live stream:
-
-- Hosts on headphones, monitors muted, is the safe configuration:
-  `uad_set_monitor(mute=true)`.
-- If the monitors must be up, the mics need to be well away from them and the level kept low. Do not
-  raise the monitor level to test this. The server rails it anyway (default ceiling -6 dB, +6 dB per
-  call, +10 dB per 30 s) and an unmute onto an above-ceiling stored level is refused.
+- Open mics with the monitors up. Hosts on headphones and monitors muted is the safe setup, but
+  ask before `uad_set_monitor(mute=true)`: the user may have no headphones on. Never raise the
+  monitor level to test anything.
+- An app that records MON L/R and also plays its own output to the Apollo's virtual channels
+  (a stream app's "monitor" output, a call app on the same pair). That loops the mix into itself.
 - **If it squeals, `uad_safe_state()` first.** It mutes every monitor output and turns talkback off,
   takes no arguments and needs no confirmation. Diagnose afterwards.
 
-## Mute discipline during a recording
+## Mute discipline during a show
 
 Muting a channel mid-show is a normal request and is safe:
 
@@ -140,8 +187,8 @@ uad_set_channels(items=[{"target": "GUEST", "mute": true}])
 uad_set_channels(items=[{"target": "GUEST", "mute": false}])
 ```
 
-Solo is not a mute. Soloing one channel changes what everyone hears and is almost never wanted
-during a live show. If `solo` is set anywhere unexpectedly, `uad_list_channels` shows it.
+Solo is not a mute. Soloing one channel changes what everyone hears, the stream included, and is
+almost never wanted during a live show. `uad_mode(mode="livestream")` clears stray solos.
 
 ## Lock it in
 

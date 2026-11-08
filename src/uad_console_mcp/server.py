@@ -26,11 +26,12 @@ import dataclasses
 import functools
 import json
 import logging
+import re
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from typing import Any, Literal
 
-from . import __version__, snapshot
+from . import __version__, modes, routing, snapshot
 from .client import (
     UAClient,
     UAConnectError,
@@ -45,6 +46,7 @@ from .discovery import (
     TargetNotFoundError,
     discover,
 )
+from .profile import Profile, ProfileError, ProfileStore, build_sources, notes_text
 from .safety import (
     AUDIO_FLOWING_DB,
     DIM_ATTENUATION_PROPERTY,
@@ -101,12 +103,18 @@ that API, not missing features.
 
 ## Levels and routing
 - **Headphone output level cannot be set.** The HP outputs expose no level property at all, only
-  their `MixInSource` (which cue bus feeds them). Workaround: pick the cue bus with
-  `MixInSource`, then set the *send* levels into that cue bus with `uad_set_sends`, and use the
+  their `MixInSource` (which cue bus feeds them), and no tool changes that. Workaround: pick the
+  cue bus for each HP output in Console (`uad_get_mix` shows which output plays which cue), then
+  set the *send* levels into that cue bus with `uad_set_sends`, and use the
   physical knob for the final trim.
-- **The I/O routing matrix (`/inputroutes`, `/outputroutes`) cannot be re-patched here.** No tool
-  writes it, and the property that actually carries the mapping (`ChannelIndex`) is not on the
-  safe-mode allowlist. Use `uad_raw_get` to inspect it; re-routing needs UAD Console itself.
+- **The I/O routing matrix (`/inputroutes`, `/outputroutes`, `IOMapPreset`) cannot be re-patched
+  here.** `uad_get_routing` reads it: the channel numbers apps see, where the monitor-mix and aux
+  loopback inputs (`MON L/R`, `AUX1 L/R`, `AUX2 L/R`) land, and which virtual channels are
+  enabled. Moving channels (for example to put `MON L/R` on inputs 1-2 for a stream app) is done
+  in UAD Console > Settings > I/O Matrix.
+- **Which app plays into which virtual channel is set in macOS, not here.** Audio MIDI Setup >
+  Configure Speakers picks the Apollo channels system audio uses; each app picks its own device.
+  Prove a route with `uad_peek_meters` while something plays.
 - **Channels cannot be created or deleted.** The strip list is fixed by the hardware model.
 - **Monitor level is capped** by `UAD_MCP_MAX_MONITOR_DB` (default -6 dB), with at most +6 dB per
   call and +10 dB per 30 s. Unmuting or un-dimming onto an above-ceiling stored level is refused,
@@ -225,6 +233,7 @@ class ServerContext:
         gate: SafetyGate | None = None,
         *,
         snapshots: SnapshotStore | None = None,
+        profiles: ProfileStore | None = None,
         rig_ttl_s: float = RIG_TTL_S,
         talkback_auto_off_s: float = TALKBACK_AUTO_OFF_S,
         talkback_retry_delays_s: Sequence[float] = TALKBACK_AUTO_OFF_RETRY_DELAYS_S,
@@ -234,6 +243,7 @@ class ServerContext:
         self.client = client
         self.gate = gate if gate is not None else gate_from_env()
         self.snapshots = snapshots if snapshots is not None else SnapshotStore()
+        self.profiles = profiles if profiles is not None else ProfileStore()
         self.rig_ttl_s = rig_ttl_s
         self.talkback_auto_off_s = talkback_auto_off_s
         self.talkback_retry_delays_s = tuple(talkback_retry_delays_s)
@@ -691,6 +701,31 @@ async def tool_get_status(ctx: ServerContext) -> dict[str, Any]:
         },
         "devices": devices,
         "safety": ctx.gate.describe(),
+        "rig_profile": _profile_status(ctx),
+    }
+
+
+def _profile_status(ctx: ServerContext) -> dict[str, Any]:
+    """Whether the user's setup is on file, so a new session knows to read it or ask for it."""
+    store = ctx.profiles
+    if not store.exists:
+        return {
+            "saved": False,
+            "hint": (
+                "No rig profile yet. Ask what is plugged into each input (and what kind of mic), "
+                "which virtual pair carries computer audio, then save it with "
+                "uad_rig_profile(action='save', ...)."
+            ),
+        }
+    try:
+        profile = store.load()
+    except ProfileError as exc:
+        return {"saved": True, "error": str(exc)}
+    return {
+        "saved": True,
+        "sources": len(profile.sources),
+        "updated": profile.updated,
+        "hint": "Read it with uad_rig_profile() before changing anything.",
     }
 
 
@@ -863,6 +898,8 @@ async def tool_set_preamp(
             f"{channel.label()} has no preamp, so gain, pad, 48V and Hi-Z do not exist on it. "
             "Use uad_list_channels and pick a channel with has_preamp true."
         )
+    if phantom_48v is not None and not coerces_to_false(phantom_48v):
+        _refuse_ribbon_phantom(ctx, channel)
     preamp = f"{channel.path}/preamps/0"
     requests: list[tuple[str, Any, WriteContext | str]] = []
     if source is not None:
@@ -911,6 +948,29 @@ async def tool_set_preamp(
         "writes": writes,
         **({"errors": errors} if errors else {}),
     }
+
+
+def _refuse_ribbon_phantom(ctx: ServerContext, channel: ChannelInfo) -> None:
+    """48V onto an input the rig profile says has a ribbon mic is refused, confirmation or not.
+
+    ``confirm_condenser_mic`` is one sentence from a model; the profile is what the user said
+    about their own gear. When they disagree, the gear wins until the profile is corrected. A
+    profile that cannot be read fails closed for the same reason.
+    """
+    try:
+        source = ctx.profiles.load().source(channel.device, channel.index)
+    except ProfileError as exc:
+        raise SafetyRefusal(
+            f"Refused to switch 48V on at {channel.label()}: the rig profile could not be read, "
+            f"so a ribbon mic cannot be ruled out. {exc}"
+        ) from exc
+    if source is not None and source.mic_type == "ribbon":
+        raise SafetyRefusal(
+            f"Refused to switch 48V on at {channel.label()}: the rig profile says a ribbon mic "
+            f"({source.plugged_in or 'unnamed'}) is plugged in there, and phantom power can "
+            "destroy it. If the mic has changed, ask the user, update the profile with "
+            "uad_rig_profile(action='save', ...), then try again."
+        )
 
 
 async def _send_index(ctx: ServerContext, channel: ChannelInfo, send: str | int) -> tuple[str, str]:
@@ -2105,6 +2165,370 @@ async def tool_raw_set(ctx: ServerContext, path: str, value: Any) -> dict[str, A
     return {"writes": [write]}
 
 
+# ------------------------------------------------------------------------------ routing
+
+ROUTE_FIELDS = ("Name", "IOType", "ChannelIndex", "Active")
+SEND_PROBE = 8
+"""Send slots probed per strip. Inputs have 6 (aux1, aux2, cue1..cue4), aux strips 4."""
+BUS_PATTERN = re.compile(r"^(aux[12]|cue[1-4])$")
+
+
+async def _routes(ctx: ServerContext, root: str) -> list[dict[str, Any]]:
+    _, children = await ctx.client.get_node(root)
+    values = await ctx.poll(
+        [f"{root}/{child}/{field}" for child in children for field in ROUTE_FIELDS]
+    )
+    return routing.route_entries(children, values, root)
+
+
+async def _routing_summary(ctx: ServerContext) -> dict[str, Any]:
+    inputs = await _routes(ctx, "/inputroutes")
+    outputs = await _routes(ctx, "/outputroutes")
+    try:
+        preset = await ctx.client.get_prop("/IOMapPreset")
+    except UAPathError:
+        value, options = None, None
+    else:
+        value, options = preset.value, preset.values
+    return routing.summarize(inputs, outputs, preset=value, presets=options)
+
+
+@tool
+async def tool_get_routing(ctx: ServerContext) -> dict[str, Any]:
+    """The driver I/O map apps see, with the loopback inputs and virtual outputs called out."""
+    return await _routing_summary(ctx)
+
+
+# ---------------------------------------------------------------------------------- mixes
+
+
+def _default_device(rig: Rig, device: int | None) -> int:
+    if device is not None:
+        rig.device(device)
+        return device
+    if not rig.devices:
+        raise UAError("The engine reports no Apollo at all. Check uad_get_status.")
+    return min(rig.devices, key=lambda d: d.multi_unit_order).index
+
+
+async def _bus_send_paths(
+    ctx: ServerContext, channels: Sequence[ChannelInfo], bus: str
+) -> dict[str, str]:
+    """``channel.path -> send node path`` for every strip that has a send with ID ``bus``."""
+    probe = [f"{c.path}/sends/{slot}/ID" for c in channels for slot in range(SEND_PROBE)]
+    ids = await ctx.poll(probe)
+    found: dict[str, str] = {}
+    for path in probe:  # probe order, so the first matching slot wins deterministically
+        if str(ids.get(path) or "").casefold() == bus:
+            send = path.rsplit("/", 1)[0]
+            found.setdefault(send.rsplit("/sends/", 1)[0], send)
+    return found
+
+
+async def _loaded_effects(ctx: ServerContext, channel: ChannelInfo) -> list[str]:
+    paths = [f"{channel.path}/effects/{slot}/EffectName" for slot in range(4)]
+    values = await ctx.poll(paths)
+    return [str(values[path]) for path in paths if values.get(path)]
+
+
+async def _headphone_sources(ctx: ServerContext, rig: Rig, device: int) -> dict[str, str]:
+    """``output name -> cue it plays`` for the headphone-style outputs (``HP 1`` ...)."""
+    outputs = [c for c in rig.channels_of("output", device) if not c.is_monitor]
+    values = await ctx.poll([f"{c.path}/MixInSource" for c in outputs])
+    heard: dict[str, str] = {}
+    for channel in outputs:
+        source = values.get(f"{channel.path}/MixInSource")
+        if isinstance(source, str) and (
+            re.fullmatch(r"cue\d", source) or source in ("default", "none")
+        ):
+            heard[channel.name] = source
+    return heard
+
+
+@tool
+async def tool_get_mix(ctx: ServerContext, bus: str, device: int | None = None) -> dict[str, Any]:
+    """Who is in one aux or cue bus, at what send level, and where that bus goes."""
+    wanted = str(bus).strip().casefold()
+    if not BUS_PATTERN.match(wanted):
+        raise ValueError(
+            f"bus {bus!r} is not one of aux1, aux2, cue1, cue2, cue3, cue4. For the monitor mix "
+            "itself use uad_list_channels (fader and mute are the monitor mix)."
+        )
+    rig = await ctx.rig()
+    dev = _default_device(rig, device)
+    pool = rig.channels_of("input", dev)
+    if wanted.startswith("cue"):
+        pool += rig.channels_of("aux", dev)  # aux returns can feed the headphones too
+    send_paths = await _bus_send_paths(ctx, pool, wanted)
+    if not send_paths:
+        raise UAError(f"No strip on device {dev} has a {wanted} send. Check uad_get_status.")
+    values = await ctx.poll(
+        [f"{send}/{prop}" for send in send_paths.values() for prop in ("Gain", "Pan", "Bypass")]
+        + [f"{path}/Mute" for path in send_paths]
+    )
+    in_mix: list[dict[str, Any]] = []
+    off: list[str] = []
+    for channel in pool:
+        send = send_paths.get(channel.path)
+        if send is None:
+            continue
+        level = _number(values.get(f"{send}/Gain"))
+        bypass = values.get(f"{send}/Bypass") is True
+        if level is None or level <= modes.SEND_OFF_DB + 0.05 or bypass:
+            off.append(channel.name)
+            continue
+        entry: dict[str, Any] = {
+            "name": channel.name,
+            "index": channel.index,
+            "kind": channel.kind,
+            "level_db": level,
+        }
+        pan = _number(values.get(f"{send}/Pan"))
+        if pan is not None:
+            entry["pan"] = pan
+        if values.get(f"{channel.path}/Mute") is True:
+            entry["strip_muted"] = True
+        in_mix.append(entry)
+    result: dict[str, Any] = {"bus": wanted, "device": dev, "sources": in_mix, "off": off}
+    warnings: list[str] = []
+    if wanted.startswith("cue"):
+        count = rig.device(dev).cue_bus_count
+        if int(wanted[3:]) > count:
+            warnings.append(
+                f"This device has {count} cue bus(es), so {wanted} reaches no real output."
+            )
+        heard = await _headphone_sources(ctx, rig, dev)
+        result["heard_on"] = sorted(name for name, source in heard.items() if source == wanted)
+    else:
+        aux = modes.aux_strip(rig, dev, wanted)
+        if aux is not None:
+            state = await ctx.poll(
+                [f"{aux.path}/{p}" for p in ("FaderLevel", "Mute", "SendPostFader")]
+            )
+            result["return"] = {
+                "name": aux.name,
+                "fader_db": _number(state.get(f"{aux.path}/FaderLevel")),
+                "mute": state.get(f"{aux.path}/Mute"),
+            }
+            post = state.get(f"{aux.path}/SendPostFader")
+            if isinstance(post, bool):
+                result["sends_post_fader"] = post
+            result["plugins"] = await _loaded_effects(ctx, aux)
+        inputs = await _routes(ctx, "/inputroutes")
+        result["recorded_on"] = routing.capture(inputs, wanted)
+    if any(entry.get("strip_muted") for entry in in_mix):
+        warnings.append(
+            "Some sources are muted on their own strip; on a post-fader bus that silences them "
+            "here too."
+        )
+    if warnings:
+        result["warnings"] = warnings
+    return result
+
+
+# ---------------------------------------------------------------------------- rig profile
+
+
+@tool
+async def tool_rig_profile(
+    ctx: ServerContext,
+    action: str = "get",
+    sources: list[dict[str, Any]] | None = None,
+    notes: str | None = None,
+) -> dict[str, Any]:
+    """Read or save the user's own description of their rig. Writes a local file only."""
+    verb = action.strip().casefold()
+    store = ctx.profiles
+    if verb == "get":
+        profile = store.load()
+        try:
+            rig: Rig | None = await ctx.rig()
+        except UAConnectError:
+            rig = None
+        listed = []
+        for source in profile.sources:
+            entry = source.as_dict()
+            if rig is not None:
+                live = [
+                    c for c in rig.channels_of("input", source.device) if c.index == source.index
+                ]
+                if not live:
+                    entry["missing"] = True
+                elif live[0].name != source.name:
+                    entry["current_name"] = live[0].name
+            listed.append(entry)
+        result: dict[str, Any] = {
+            "action": "get",
+            "saved": store.exists,
+            "path": str(store.path),
+            "updated": profile.updated,
+            "sources": listed,
+            "notes": profile.notes,
+        }
+        if not store.exists:
+            result["hint"] = (
+                "Nothing saved yet. Ask the user what is plugged into each input they use (mic "
+                "model and type: dynamic, condenser, ribbon, or line), which input is their voice, "
+                "and which virtual pair carries computer audio. Then save it."
+            )
+        return result
+    if verb != "save":
+        raise ValueError(f"action={action!r} is not supported. Use get or save.")
+    if sources is None and notes is None:
+        raise ValueError(
+            "save needs sources and/or notes. Read the profile first with action='get'."
+        )
+    rig = await ctx.rig()
+    old = store.load()
+    profile = Profile(
+        sources=build_sources(sources, rig) if sources is not None else old.sources,
+        notes=notes_text(notes) if notes is not None else old.notes,
+        device_types=[device.type_id for device in rig.devices],
+    )
+    path = store.save(profile)
+    ribbons = [s.name for s in profile.sources if s.mic_type == "ribbon"]
+    return {
+        "action": "save",
+        "path": str(path),
+        "sources": [source.as_dict() for source in profile.sources],
+        "notes": profile.notes,
+        **(
+            {"ribbon_guard": f"48V is now refused on {', '.join(ribbons)}, confirmation or not."}
+            if ribbons
+            else {}
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------------- modes
+
+
+def _flag(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+async def _mode_facts(ctx: ServerContext, rig: Rig, selection: modes.Selection) -> modes.Facts:
+    device = selection.device
+    strips = rig.channels_of("input", device) + rig.channels_of("aux", device)
+    fields = (
+        ("mute", "Mute"),
+        ("solo", "Solo"),
+        ("fader_db", "FaderLevel"),
+        ("hidden", "ChannelHidden"),
+    )
+    values = await ctx.poll(
+        [f"{c.path}/{prop}" for c in strips for _, prop in fields]
+        + [f"{c.path}/preamps/0/48V" for c in strips if c.has_preamp]
+    )
+    facts = modes.Facts(
+        strips={
+            c.path: modes.StripState(
+                mute=_flag(values.get(f"{c.path}/Mute")),
+                solo=_flag(values.get(f"{c.path}/Solo")),
+                fader_db=_number(values.get(f"{c.path}/FaderLevel")),
+                hidden=_flag(values.get(f"{c.path}/ChannelHidden")),
+                phantom=_flag(values.get(f"{c.path}/preamps/0/48V")),
+            )
+            for c in strips
+        }
+    )
+    if selection.mode == "mixing":
+        return facts
+    facts.routing = await _routing_summary(ctx)
+    if selection.bus:
+        send_paths = await _bus_send_paths(ctx, rig.channels_of("input", device), selection.bus)
+        gains = await ctx.poll([f"{path}/Gain" for path in send_paths.values()])
+        facts.bus_sends = {
+            channel: _number(gains.get(f"{path}/Gain")) for channel, path in send_paths.items()
+        }
+        if selection.bus.startswith("aux"):
+            aux = modes.aux_strip(rig, device, selection.bus)
+            facts.bus_plugins = await _loaded_effects(ctx, aux) if aux else []
+    if selection.mode == "livestream":
+        try:
+            monitor = rig.monitor_output(device)
+        except UAError:
+            monitor = None
+        if monitor is not None:
+            facts.monitor_muted = _flag(await ctx.value(f"{monitor.path}/Mute"))
+    if selection.mode == "tracking":
+        facts.headphones = await _headphone_sources(ctx, rig, device)
+    return facts
+
+
+@tool
+async def tool_mode(
+    ctx: ServerContext,
+    action: str = "plan",
+    mode: str | None = None,
+    inputs: list[str | int] | None = None,
+    system_audio: str | int | None = None,
+    guest: str | int | None = None,
+    bus: str | None = None,
+    device: int | None = None,
+) -> dict[str, Any]:
+    """Plan or apply a workflow mode. Plan is the default and writes nothing."""
+    verb = action.strip().casefold()
+    if verb == "list":
+        return {"action": "list", "modes": modes.describe(), "never": list(modes.NEVER)}
+    if verb not in ("plan", "apply"):
+        raise ValueError(f"action={action!r} is not supported. Use list, plan or apply.")
+    if not mode:
+        raise ValueError(f"mode is required for {verb}: one of {', '.join(modes.MODES)}.")
+    rig = await ctx.rig()
+    profile = ctx.profiles.load()
+    selection = modes.select(
+        mode,
+        rig,
+        profile,
+        device=device,
+        inputs=inputs,
+        system_audio=system_audio,
+        guest=guest,
+        bus=bus,
+    )
+    planned = modes.plan(selection, rig, profile, await _mode_facts(ctx, rig, selection))
+    if verb == "plan":
+        return {
+            "action": "plan",
+            **planned,
+            "next": (
+                "Answer the questions first."
+                if planned["questions"]
+                else "Show the user the summary, warnings and you_do steps. Apply with "
+                "action='apply' and the same arguments once they agree."
+            ),
+        }
+
+    if planned["questions"]:
+        raise UAError(f"Cannot apply {selection.mode} yet: " + " ".join(planned["questions"]))
+    if ctx.gate.mode == "readonly":
+        raise SafetyRefusal(
+            f"Refused to apply {selection.mode}: safety mode is 'readonly', so nothing is "
+            "written. Set UAD_MCP_MODE=safe to allow writes."
+        )
+    if planned["writes"] == 0:
+        return {"action": "apply", **planned, "snapshot": None, "results": {}}
+    name = f"pre-mode-{selection.mode}-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}"
+    ctx.snapshots.save(await snapshot.capture(ctx.client, rig, name=name), name)
+    results: dict[str, Any] = {}
+    if planned["channels"]:
+        results["channels"] = await tool_set_channels(ctx, planned["channels"])
+    if planned["sends"]:
+        results["sends"] = await tool_set_sends(ctx, planned["sends"])
+    return {
+        "action": "apply",
+        "ok": all(result.get("ok") for result in results.values()),
+        **planned,
+        "results": results,
+        "snapshot": name,
+        "revert": (
+            f"uad_snapshot(action='restore', name={name!r}) shows the dry run; run it with "
+            "dry_run=false to put everything back."
+        ),
+    }
+
+
 # ------------------------------------------------------------------------------- prompts
 
 SETUP_VOCAL_TRACKING = """\
@@ -2231,6 +2655,47 @@ Do not, while sorting this out: raise the monitor level to hear whether it is fi
 unmute everything at once; change the clock source or sample rate; or engage 48V.
 """
 
+SETUP_LIVESTREAM = """\
+Set me up to livestream my microphone together with my computer's audio (music, a game, a video,
+a browser tab), with the UAD plugins on the mic.
+
+1. `uad_get_status` and `uad_rig_profile()`. If the profile is empty, ask me which input my mic is
+   on and what kind of mic it is, and save it with `uad_rig_profile(action="save", ...)`.
+2. `uad_mode(action="plan", mode="livestream")`. Show me the summary, every warning and every
+   `you_do` step in plain words. If it asks a question, ask me; do not pick for me.
+3. Only after I agree: `uad_mode(action="apply", mode="livestream")` with the same arguments.
+   Keep the `snapshot` name it returns: that is how we undo it.
+4. Walk me through the `you_do` steps one at a time: computer audio to the virtual channel in
+   Audio MIDI Setup, then the stream app's input (`uad_get_routing` has the exact channel numbers).
+   Wait for me after each one.
+5. Run the `check` steps: `uad_watch_meters` while I talk and play something, then a short test
+   recording in the stream app.
+6. If I have a guest on a call, plan again with `guest=` set to the strip the call app plays into.
+   The guest must never hear themselves.
+
+If anything squeals: `uad_safe_state` first, questions afterwards. Never raise the monitor level,
+never switch 48V without asking what mic it is.
+"""
+
+RIG_PROFILE_INTERVIEW = """\
+Learn my Apollo setup once, so later sessions do not have to ask.
+
+1. `uad_get_status`, then `uad_list_channels(kind="input")`, then `uad_rig_profile()` to see what
+   is already saved.
+2. Ask me, a few at a time: what is plugged into each input I use (make and model), and for every
+   preamp input what kind of source it is: dynamic, condenser, ribbon, or line. Ask which input is
+   my main voice, which inputs are instruments, and which virtual pair my computer audio plays to
+   (usually VIRTUAL 1). Ask about the gear around it too: ADAT expander, monitors, headphones, the
+   DAW and the stream or call apps I use. Do not guess any of it.
+3. Show me the profile you would save, then `uad_rig_profile(action="save", sources=[...],
+   notes="...")`. `sources` replaces the whole list. Roles: voice, instrument, system_audio,
+   call_guest, other. Mic types: dynamic, condenser, ribbon, line, unknown.
+4. Tell me what it changes: a ribbon mic in the profile makes 48V refused on that input until the
+   profile changes, and `uad_mode` uses the roles as its defaults.
+
+The profile is a file on this Mac. Saving it writes nothing to the Apollo.
+"""
+
 
 # --------------------------------------------------------------------------- registration
 
@@ -2245,6 +2710,8 @@ READ_ONLY_TOOLS = frozenset(
         "uad_peek_meters",
         "uad_watch_meters",
         "uad_raw_get",
+        "uad_get_routing",
+        "uad_get_mix",
     }
 )
 
@@ -2275,10 +2742,13 @@ def build_server(ctx: ServerContext) -> Any:
         version=__version__,
         instructions=(
             "Controls Universal Audio Apollo interfaces through the local UA Mixer Engine. "
-            "Resolve channels by name where possible, read before you write, and treat every "
-            "refusal as information: the message names the environment variable or confirm flag "
-            "that would unblock it. Monitor levels and 48V phantom power can damage ears, "
-            "speakers and ribbon microphones."
+            "Start a session with uad_get_status and uad_rig_profile: the profile is the user's "
+            "own description of what is plugged in where. For a job (livestream, tracking, "
+            "mixing) use uad_mode: plan, show the user, apply on their yes. Resolve channels by "
+            "name where possible, read before you write, and treat every refusal as "
+            "information: the message names the environment variable or confirm flag that would "
+            "unblock it. Monitor levels and 48V phantom power can damage ears, speakers and "
+            "ribbon microphones."
         ),
     )
 
@@ -2726,6 +3196,93 @@ def build_server(ctx: ServerContext) -> Any:
     async def uad_raw_get(path: str) -> dict[str, Any]:
         return await tool_raw_get(ctx, path)
 
+    @register(
+        name="uad_get_routing",
+        description=(
+            "Read the driver I/O map: the input and output channel numbers apps see (route order, "
+            "1-based), where the loopback inputs land (MON L/R = the Console monitor mix, AUX1 "
+            "L/R, AUX2 L/R), which virtual outputs feed which Virtual strip and whether they are "
+            "enabled, and the I/O Matrix preset.\n"
+            "Use when: telling the user which channels to pick in a stream app, call app or Audio "
+            "MIDI Setup, or checking that MON L/R are on inputs 1-2.\n"
+            "Not for: changing routing - that is UAD Console > Settings > I/O Matrix."
+        ),
+    )
+    async def uad_get_routing() -> dict[str, Any]:
+        return await tool_get_routing(ctx)
+
+    @register(
+        name="uad_get_mix",
+        description=(
+            "Show one aux or cue bus: every strip sending to it with its send level and pan, "
+            "which strips are off, and where the bus goes (headphone outputs for a cue; the aux "
+            "return, its plugins and the driver inputs that record it for an aux).\n"
+            "Use when: answering 'what is in my headphones?' or 'what does the call hear?', and "
+            "before changing sends.\n"
+            "Not for: the monitor mix itself - that is the faders and mutes in uad_list_channels."
+        ),
+    )
+    async def uad_get_mix(
+        bus: Literal["aux1", "aux2", "cue1", "cue2", "cue3", "cue4"], device: int | None = None
+    ) -> dict[str, Any]:
+        return await tool_get_mix(ctx, bus, device=device)
+
+    @register(
+        name="uad_rig_profile",
+        description=(
+            "Read (action='get', the default) or save (action='save') the user's own description "
+            "of their rig: what is plugged into each input, mic type (dynamic, condenser, ribbon, "
+            "line, unknown), role (voice, instrument, system_audio, call_guest, other) and free "
+            "notes. Each source: {target: name or index, device?, plugged_in?, mic_type?, role?, "
+            "notes?}. sources replaces the whole list; notes alone keeps the sources.\n"
+            "Use when: starting a session (read it), or once the user has told you their setup "
+            "(save it). A ribbon mic in the profile makes 48V refused on that input.\n"
+            "Not for: Apollo state - saving writes a local file and nothing to the hardware."
+        ),
+    )
+    async def uad_rig_profile(
+        action: Literal["get", "save"] = "get",
+        sources: list[dict[str, Any]] | None = None,
+        notes: str | None = None,
+    ) -> dict[str, Any]:
+        return await tool_rig_profile(ctx, action=action, sources=sources, notes=notes)
+
+    @register(
+        name="uad_mode",
+        description=(
+            "Set the Console up for a job in one call. Modes: 'livestream' (mic plus computer "
+            "audio into the monitor mix a stream app records from MON L/R; optional call guest "
+            "with a mix-minus on an aux bus), 'tracking' (open an input and put it in a "
+            "headphone cue), 'mixing' (mute every hardware input so only DAW playback is heard). "
+            "action='plan' (default) writes nothing and returns the exact changes, warnings, the "
+            "steps the user must do in macOS and apps, and checks. action='apply' saves a "
+            "pre-mode snapshot, then writes through uad_set_channels and uad_set_sends. "
+            "action='list' describes the modes. Arguments default to the rig profile.\n"
+            "Use when: the user names a job ('I want to stream', 'I'm mixing now'), or switching "
+            "between jobs. Plan, show the user, apply on their yes.\n"
+            "Not for: monitor level, 48V, gain or clock - modes never touch them."
+        ),
+    )
+    async def uad_mode(
+        action: Literal["list", "plan", "apply"] = "plan",
+        mode: Literal["livestream", "tracking", "mixing"] | None = None,
+        inputs: list[str | int] | None = None,
+        system_audio: str | int | None = None,
+        guest: str | int | None = None,
+        bus: str | None = None,
+        device: int | None = None,
+    ) -> dict[str, Any]:
+        return await tool_mode(
+            ctx,
+            action=action,
+            mode=mode,
+            inputs=inputs,
+            system_audio=system_audio,
+            guest=guest,
+            bus=bus,
+            device=device,
+        )
+
     if ctx.gate.mode == "full":
 
         @register(
@@ -2772,6 +3329,15 @@ def build_server(ctx: ServerContext) -> Any:
     async def limitations_resource() -> str:
         return LIMITATIONS
 
+    @server.resource(
+        "uad://rig-profile",
+        name="The user's rig profile",
+        description="What is plugged in where, mic types and roles, as saved by uad_rig_profile.",
+        mime_type="application/json",
+    )
+    async def rig_profile_resource() -> str:
+        return json.dumps(await tool_rig_profile(ctx, action="get"), indent=1, default=str)
+
     # --------------------------------------------------------------------------- prompts
 
     @server.prompt(
@@ -2801,6 +3367,20 @@ def build_server(ctx: ServerContext) -> Any:
     )
     async def panic_reset() -> str:
         return PANIC_RESET
+
+    @server.prompt(
+        name="setup_livestream",
+        description="Stream your mic plus computer audio, with a test before going live.",
+    )
+    async def setup_livestream() -> str:
+        return SETUP_LIVESTREAM
+
+    @server.prompt(
+        name="rig_profile_interview",
+        description="Tell the agent your setup once: inputs, mic types, roles, gear.",
+    )
+    async def rig_profile_interview() -> str:
+        return RIG_PROFILE_INTERVIEW
 
     logger.info(
         "registered %d tools in %s mode: %s", len(registered), ctx.gate.mode, ", ".join(registered)
